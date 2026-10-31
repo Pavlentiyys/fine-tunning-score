@@ -21,6 +21,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from .lora import draw_seeds, replay_seeds
+from . import offload
 from .stream import _REGISTRY, get_manager, restore_all, streamed_layer
 
 # Keep only each decoder layer's input for the backward and recompute the layer there (our own
@@ -251,7 +252,9 @@ def patch_qwen2_model():
                     with replay_seeds(seeds):
                         return _decoder_layer(args[0], states, *args[1:])
 
-                if manager is not None:
+                if manager is not None and offload.ENABLED:
+                    hidden = offload.offloaded_layer(manager, i, run, hidden)
+                elif manager is not None:
                     hidden = streamed_layer(manager, i, run, layer, hidden)
                 else:
                     hidden = checkpoint(run, hidden, use_reentrant=False,

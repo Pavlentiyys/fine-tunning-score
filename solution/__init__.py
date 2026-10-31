@@ -26,6 +26,7 @@ from .rmsnorm import patch_qwen2_rmsnorm
 from .mlp import patch_qwen2_mlp_own
 from .rope import patch_qwen2_rope
 from .unpad import patch_qwen2_model
+from .offload import patch_step_end
 
 
 def apply():
@@ -46,4 +47,5 @@ def apply():
     patch_peft_lora_4bit()  # LoRA: dropout mask regenerated from a seed, no clone, one addmm
     patch_qwen2_causal_lm()  # head + loss + entropy/argmax in chunks, no full logits
     patch_sft_trainer()  # TRL metrics and Soup's rewind losses from the fused step
+    patch_step_end()  # offloaded layers: release the last weight buffer after each step
     mark("apply done")
