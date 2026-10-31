@@ -20,7 +20,35 @@ CPU (unpad.py) and streams the head in vocabulary chunks (fused_ce.py).
 import torch
 
 EMBEDDING_ON_CPU = True
+NO_ALLOCATOR_WARMUP = True
 VOCAB, HIDDEN = 151936, 1536  # Qwen2.5-1.5B's tied embedding: the one tensor of this shape
+
+# what happened to the embedding while loading; printed with the first [mem] line of training
+LOAD_EVENTS = {"materialize calls": 0, "embedding materialized on cpu": 0,
+               "dispatch kept it on cpu": 0, "dispatch saw it on cuda": 0}
+
+
+def load_summary():
+    return ", ".join(f"{name} {count}" for name, count in LOAD_EVENTS.items())
+
+
+def patch_no_allocator_warmup():
+    """Skip transformers' `caching_allocator_warmup`.
+
+    Before loading the weights, transformers allocates (and frees) one tensor as large as all the
+    parameters bound for the GPU, so that the caching allocator reserves that memory in one cudaMalloc
+    instead of many. Here the 4-bit weights leave the GPU as soon as they are quantized (stream.py)
+    and the embedding is loaded to the CPU, so that reservation (~1.07 GB: the model's full size) was
+    the peak of the whole process, held by the allocator although nothing ever used it at once. Without
+    it, loading allocates per tensor, which on a 1.5B 4-bit model costs a fraction of a second."""
+    if not NO_ALLOCATOR_WARMUP:
+        return
+    from transformers import modeling_utils
+
+    def caching_allocator_warmup(*args, **kwargs):
+        print("[load] transformers' caching_allocator_warmup skipped", flush=True)
+
+    modeling_utils.caching_allocator_warmup = caching_allocator_warmup
 
 
 def patch_embedding_load_to_cpu():
@@ -34,10 +62,12 @@ def patch_embedding_load_to_cpu():
     def materialize(tensor, device=None, dtype=None):
         # `tensor` may be a lazy safetensors slice without `.shape`: read it first (on the CPU,
         # which is where the slice is read anyway), then decide where it goes
+        LOAD_EVENTS["materialize calls"] += 1
         tensor = tensor[...]
         if (device is not None and torch.device(device).type == "cuda"
                 and tuple(tensor.shape) == (VOCAB, HIDDEN)):
-            print("[load] tied embedding kept in CPU memory", flush=True)
+            LOAD_EVENTS["embedding materialized on cpu"] += 1
+            print(f"[load] tied embedding kept in CPU memory (was bound for {device})", flush=True)
             return tensor.to(dtype=dtype or torch.float16)
         return original(tensor, device, dtype)
 
@@ -54,7 +84,10 @@ def patch_embedding_load_to_cpu():
     def accelerate_dispatch(model, *args, **kwargs):
         weight = getattr(model.get_input_embeddings(), "weight", None)
         if weight is None or weight.is_cuda:
+            if weight is not None:
+                LOAD_EVENTS["dispatch saw it on cuda"] += 1
             return dispatch(model, *args, **kwargs)
+        LOAD_EVENTS["dispatch kept it on cpu"] += 1
         kept = weight.data
         weight.data = torch.empty(0, dtype=kept.dtype)
         try:

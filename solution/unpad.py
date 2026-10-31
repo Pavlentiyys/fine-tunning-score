@@ -59,10 +59,24 @@ def _embedding_to_fp16(model):
 
 
 def _embedding_to_gpu(model):
-    """The embedding kept on the CPU goes back to the GPU for any forward that is not ours."""
+    """The embedding kept on the CPU goes back to the GPU for an evaluation forward (not ours)."""
     weight = model.embed_tokens.weight
     if not weight.is_cuda and torch.cuda.is_available():
+        print("[load] embedding moved to the GPU for a forward outside training", flush=True)
         weight.data = weight.data.to("cuda")
+
+
+def _embedding_to_cpu(model):
+    """Safety net: if anything carried the embedding to the GPU after loading, the first training
+    forward moves it to pinned CPU memory and gives its 467 MB back to the driver."""
+    from .prepare import EMBEDDING_ON_CPU
+
+    weight = model.embed_tokens.weight
+    if not EMBEDDING_ON_CPU or not weight.is_cuda or weight.requires_grad:
+        return
+    print("[load] embedding was on the GPU at the first training step: moved to CPU", flush=True)
+    weight.data = weight.data.to("cpu", dtype=torch.float16).pin_memory()
+    torch.cuda.empty_cache()
 
 
 def _usable(model, input_ids, attention_mask, past_key_values, inputs_embeds, use_cache, kwargs):
@@ -124,12 +138,18 @@ def patch_qwen2_model():
                        kwargs):
             if _REGISTRY:
                 restore_all()
-            _embedding_to_gpu(self)
+            if not self.training:
+                _embedding_to_gpu(self)
             return original(self, input_ids=input_ids, attention_mask=attention_mask,
                             position_ids=position_ids, past_key_values=past_key_values,
                             inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
-        _embedding_to_fp16(self)
         _STEPS[0] += 1
+        if _STEPS[0] == 1:
+            from .prepare import load_summary
+
+            _mem(f"before step 1 (embedding on {self.embed_tokens.weight.device}; {load_summary()})")
+            _embedding_to_cpu(self)
+        _embedding_to_fp16(self)
         if _STEPS[0] in (1, 2, 3, 10):
             _mem(f"forward call {_STEPS[0]} (embedding on {self.embed_tokens.weight.device})")
         batch, seq = input_ids.shape
