@@ -24,6 +24,7 @@ import torch
 
 ENABLED = True  # False: streamed layers recompute in the backward (stream._Streamed) as before
 MIN_BYTES = 1 << 20  # saved tensors from this size go to the host; smaller ones stay on the GPU
+MAX_PENDING = 1  # layers whose activations may still be on the GPU waiting for their host copy
 
 
 def _dense(t):
@@ -37,16 +38,18 @@ def _dense(t):
 
 
 class _Saved:
-    __slots__ = ("gpu", "host", "done", "back", "ready")
+    __slots__ = ("gpu", "host", "done", "back", "ready", "uses")
 
     def __init__(self, gpu):
         self.gpu, self.host, self.done, self.back, self.ready = gpu, None, None, None, None
+        self.uses = 1
 
 
 class Offloader:
     def __init__(self, manager):
         self.manager = manager
-        self.side = manager.side
+        self.side = manager.side  # host -> device: weights and the activations coming back
+        self.d2h = torch.cuda.Stream()  # device -> host: its own copy engine, next to the weights
         self.layers = {}  # layer -> [_Saved] of its forward
         self.pending = []  # (gpu tensors, event): kept alive until their copy to the host is done
         self.held = set()  # layers whose weight buffer is still held after their forward
@@ -60,12 +63,18 @@ class Offloader:
         saved = self.layers.setdefault(index, [])
         ring = self._ring_ptrs()
         keep_all = index == self.last
+        seen = {}  # the same tensor saved by two nodes is copied once
 
         def pack(t):
             if (keep_all or not t.is_cuda or t.numel() * t.element_size() < MIN_BYTES
                     or t.untyped_storage().data_ptr() in ring):
                 return t
-            entry = _Saved(t)
+            key = (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
+            entry = seen.get(key)
+            if entry is not None and entry.gpu is not None:
+                entry.uses += 1
+                return entry
+            entry = seen[key] = _Saved(t)
             saved.append(entry)
             return entry
 
@@ -77,9 +86,9 @@ class Offloader:
         if not saved:
             return
         stream = torch.cuda.current_stream()
-        self.side.wait_stream(stream)
+        self.d2h.wait_stream(stream)
         tensors = []
-        with torch.cuda.stream(self.side):
+        with torch.cuda.stream(self.d2h):
             for entry in saved:
                 gpu = entry.gpu
                 if _dense(gpu):
@@ -91,10 +100,16 @@ class Offloader:
                 entry.host = host
                 tensors.append(gpu)
             done = torch.cuda.Event()
-            done.record(self.side)
+            done.record(self.d2h)
         for entry in saved:
             entry.done, entry.gpu = done, None
         self.pending.append((tensors, done))
+        while len(self.pending) > MAX_PENDING:
+            # the copies are behind the compute: let the compute wait for the oldest layer's
+            # copy, so its GPU memory is reused only after the copy has read it
+            old_tensors, old_done = self.pending.pop(0)
+            stream.wait_event(old_done)
+            del old_tensors
 
     def prune(self):
         self.pending = [(tensors, done) for tensors, done in self.pending if not done.query()]
@@ -133,9 +148,18 @@ class Offloader:
             back = torch.empty_strided(entry.host.shape, entry.host.stride(),
                                        dtype=entry.host.dtype, device="cuda")
             back.copy_(entry.host, non_blocking=True)
+            entry.uses -= 1
+            if entry.uses > 0:
+                entry.back, entry.ready = back, None
+            else:
+                entry.host = None
             return back
-        stream.wait_event(entry.ready)
-        back, entry.back, entry.host = entry.back, None, None
+        if entry.ready is not None:
+            stream.wait_event(entry.ready)
+        back = entry.back
+        entry.uses -= 1
+        if entry.uses <= 0:
+            entry.back, entry.host = None, None
         return back
 
     def backward_start(self, index):
