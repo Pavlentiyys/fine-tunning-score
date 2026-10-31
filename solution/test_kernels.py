@@ -162,3 +162,30 @@ def test_rope_matches_pytorch(heads):
     torch.testing.assert_close(out_k.float(), ref_k, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(q.grad.float(), ref_dq, rtol=2e-3, atol=4e-3)
     torch.testing.assert_close(k.grad.float(), ref_dk, rtol=2e-3, atol=4e-3)
+
+
+def test_lora_add_matches_pytorch():
+    from solution.lora import _dropout, _LoraAdd
+
+    torch.manual_seed(0)
+    tokens, k_in, n_out, rank, p, scaling, seed = 300, 1536, 256, 16, 0.05, 2.0, 1234
+    x = torch.randn(tokens, k_in, device="cuda", dtype=torch.float16, requires_grad=True)
+    base = torch.randn(tokens, n_out, device="cuda", dtype=torch.float16, requires_grad=True)
+    weight_a = (torch.randn(rank, k_in, device="cuda") * 0.02).requires_grad_(True)
+    weight_b = (torch.randn(n_out, rank, device="cuda") * 0.02).requires_grad_(True)
+    grad = torch.randn(tokens, n_out, device="cuda", dtype=torch.float16)
+
+    keep = _dropout(torch.ones_like(x), seed, p).float() * (1 - p)
+    assert set(keep.unique().round().tolist()) <= {0.0, 1.0}
+    assert 0.02 < 1 - keep.mean().item() < 0.08  # about p of the inputs dropped
+    ref = base.float() + scaling * ((x.float() * keep / (1 - p)) @ weight_a.t()) @ weight_b.t()
+    ref.backward(grad.float())
+    refs = [t.grad.float().clone() for t in (x, base, weight_a, weight_b)]
+    for t in (x, base, weight_a, weight_b):
+        t.grad = None
+
+    out = _LoraAdd.apply(x, base, weight_a, weight_b, p, scaling, seed)
+    out.backward(grad)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-3, atol=2e-3)
+    for got, want in zip((x.grad, base.grad, weight_a.grad, weight_b.grad), refs):
+        torch.testing.assert_close(got.float(), want, rtol=1e-2, atol=1e-2)

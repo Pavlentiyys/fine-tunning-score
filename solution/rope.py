@@ -12,8 +12,13 @@ import torch
 import triton
 import triton.language as tl
 
+# q (12 heads) and k (2 heads) share one compiled kernel; the extra lanes are masked
+ROPE_HEADS = 16
 
-@triton.jit
+
+# `seq` changes with every batch: no divisibility specialization, or each new length class would
+# compile again (every run starts with an empty Triton cache and the compile time is measured)
+@triton.jit(do_not_specialize=["seq", "sxb", "sob", "scb"])
 def soup_rope_kernel(x_ptr, out_ptr, cos_ptr, sin_ptr,
                      sxb, sxh, sxt, sob, soh, sot, scb, sct, seq, n_heads,
                      HALF: tl.constexpr, HEADS: tl.constexpr, INVERSE: tl.constexpr):
@@ -53,7 +58,7 @@ def _rotate(x, cos, sin, out_dtype, inverse):
     soup_rope_kernel[(batch * seq,)](
         x, out, cos, sin, x.stride(0), x.stride(1), x.stride(2), out.stride(0), out.stride(1),
         out.stride(2), scb, cos.stride(1), seq, heads, HALF=dim // 2,
-        HEADS=triton.next_power_of_2(heads), INVERSE=inverse, num_warps=4)
+        HEADS=ROPE_HEADS if heads <= ROPE_HEADS else triton.next_power_of_2(heads), INVERSE=inverse, num_warps=4)
     return out
 
 

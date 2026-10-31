@@ -2,13 +2,14 @@
 
 Padding. TRL pads each batch of 4 rows to its longest row. The rows average ~220 tokens (median
 140) against a longest of ~350-512, so ~40% of the positions are padding, and base Soup runs the
-whole model on them. Every op except attention is token-wise: the norms, the residual adds and the
-MLP (which holds ~88% of the matmul FLOPs). Here the residual stream lives as [real tokens, hidden];
-only the attention block sees the padded [batch, seq, hidden] layout: its input is scattered back
-(zeros at the padding) and its output gathered again. The attention module itself is untouched and
-gets the same padded shape, mask and RoPE tables as in base Soup, so even LoRA's dropout masks on
-q_proj / v_proj are drawn exactly as before. Removing padding inside a batch is allowed by the rules;
-no rows are mixed across batches.
+whole model on them. Every op except the attention itself is token-wise: the norms, the residual
+adds, the q/k/v/o projections with their LoRA, and the MLP. Here the residual stream lives as
+[real tokens, hidden] and all of those run on it; only RoPE and SDPA see the padded
+[batch, heads, seq, head_dim] layout, with the same causal + padding mask and RoPE tables as base
+Soup: q, k and v are scattered into it (zeros at the padding, which the mask hides from every real
+query) and the attention output is gathered back before o_proj. Removing padding inside a batch is
+allowed by the rules; no rows are mixed across batches. (LoRA's dropout now draws its mask over the
+real tokens only, so the masks are not bit-identical to base Soup's; they are the same dropout.)
 
 Embedding. `prepare_model_for_kbit_training` upcasts the tied embedding / lm_head (151936 x 1536) to
 fp32: 934 MB. The checkpoint stores it in bf16, whose values fp16 holds exactly in the range they
@@ -40,16 +41,37 @@ def _usable(model, input_ids, attention_mask, past_key_values, inputs_embeds, us
             and not kwargs.get("output_attentions"))
 
 
-def _decoder_layer(layer, hidden, rows, flat_len, shape, mask, position_ids, position_embeddings,
-                   kwargs):
+def _attention(attn, normed, rows, flat_len, shape, mask, position_embeddings, kwargs):
+    """Qwen2Attention.forward with the projections on the real tokens only."""
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from transformers.models.qwen2 import modeling_qwen2
+
+    batch, seq = shape
+
+    def to_heads(states):
+        padded = states.new_zeros(flat_len, states.shape[-1]).index_copy(0, rows, states)
+        return padded.view(batch, seq, -1, attn.head_dim).transpose(1, 2)
+
+    query = to_heads(attn.q_proj(normed))
+    key = to_heads(attn.k_proj(normed))
+    value = to_heads(attn.v_proj(normed))
+    cos, sin = position_embeddings
+    query, key = modeling_qwen2.apply_rotary_pos_emb(query, key, cos, sin)
+    interface = ALL_ATTENTION_FUNCTIONS.get_interface(attn.config._attn_implementation,
+                                                      modeling_qwen2.eager_attention_forward)
+    out, _ = interface(attn, query, key, value, mask,
+                       dropout=0.0 if not attn.training else attn.attention_dropout,
+                       scaling=attn.scaling, sliding_window=attn.sliding_window, **kwargs)
+    out = out.reshape(flat_len, -1).index_select(0, rows)
+    return attn.o_proj(out)
+
+
+def _decoder_layer(layer, hidden, rows, flat_len, shape, mask, position_embeddings, kwargs):
     """Qwen2DecoderLayer.forward with the residual stream as [n_real, hidden]."""
     residual = hidden
     normed = layer.input_layernorm(hidden)
-    padded = normed.new_zeros(flat_len, normed.shape[-1]).index_copy(0, rows, normed)
-    attn, _ = layer.self_attn(hidden_states=padded.view(*shape, -1), attention_mask=mask,
-                              position_ids=position_ids, past_key_values=None, use_cache=False,
-                              position_embeddings=position_embeddings, **kwargs)
-    hidden = residual + attn.reshape(flat_len, -1).index_select(0, rows)
+    hidden = residual + _attention(layer.self_attn, normed, rows, flat_len, shape, mask,
+                                   position_embeddings, kwargs)
     residual = hidden
     hidden = layer.mlp(layer.post_attention_layernorm(hidden))
     return residual + hidden
@@ -89,8 +111,8 @@ def patch_qwen2_model():
         hidden = embeds.reshape(flat_len, -1).index_select(0, rows)
         for i, layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             hidden = _decoder_layer(layer, hidden, rows, flat_len, (batch, seq),
-                                    masks[self.config.layer_types[i]], position_ids,
-                                    position_embeddings, kwargs)
+                                    masks[self.config.layer_types[i]], position_embeddings,
+                                    kwargs)
         hidden = self.norm(hidden)
         out = hidden.new_zeros(flat_len, hidden.shape[-1]).index_copy(0, rows, hidden)
         return BaseModelOutputWithPast(last_hidden_state=out.view(batch, seq, -1),

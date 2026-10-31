@@ -13,6 +13,7 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+from .lora import patch_peft_lora_4bit
 from .fused_ce import patch_qwen2_causal_lm, patch_sft_trainer
 from .rmsnorm import patch_qwen2_rmsnorm
 from .mlp import patch_qwen2_mlp_own
@@ -24,6 +25,7 @@ def apply():
     patch_qwen2_mlp_own()  # our SwiGLU, backward in place over the saved gate/up
     patch_qwen2_rmsnorm()  # fp32 residual in, fp16 out: the layer's activations become fp16
     patch_qwen2_rope()  # q/k rotation in one kernel, fp16 out, nothing saved
-    patch_qwen2_model()  # residual/norms/MLP on real tokens only; tied embedding in fp16
+    patch_qwen2_model()  # everything but RoPE+SDPA on real tokens only; tied embedding in fp16
+    patch_peft_lora_4bit()  # LoRA: dropout mask regenerated from a seed, no clone, one addmm
     patch_qwen2_causal_lm()  # head + loss + entropy/argmax in chunks, no full logits
     patch_sft_trainer()  # TRL metrics and Soup's rewind losses from the fused step
