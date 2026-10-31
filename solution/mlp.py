@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .mode import fast_ok
+from .mode import GU, fast_ok
 
 COLS = 1024
 
@@ -88,6 +88,18 @@ def patch_qwen2_mlp_own():
         act = getattr(getattr(self, "config", None), "hidden_act", "silu")
         if act != "silu" or not x.is_cuda or not fast_ok():
             return original(self, x)
+        mode = GU["mode"]
+        if mode is not None:
+            from . import gustash
+
+            if mode == "replay":
+                out = gustash.replay(self, x)
+                if out is not None:
+                    return out
+            else:  # "capture": the streamed forward keeps gate/up for the backward's recompute
+                gate, up = self.gate_proj(x), self.up_proj(x)
+                gustash.capture(self, gate, up)
+                return self.down_proj(swiglu_inplace(gate, up))
         return self.down_proj(swiglu_inplace(self.gate_proj(x), self.up_proj(x)))
 
     modeling_qwen2.Qwen2MLP.forward = forward

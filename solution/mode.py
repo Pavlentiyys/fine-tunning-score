@@ -8,6 +8,10 @@ import torch
 
 STREAMED_FORWARD = [False]
 
+# What the MLP of the layer being run should do with its gate/up outputs (gustash.py): "capture"
+# in the streamed forward, "replay" in the recompute of the backward, None everywhere else.
+GU = {"manager": None, "index": None, "mode": None}
+
 
 def fast_ok():
     """Grad mode on, or inside the streamed forward of a layer."""

@@ -227,3 +227,35 @@ def test_dequant_once_matches_bitsandbytes(rows):
         bnb.matmul_4bit = original
     torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(x.grad, ref_dx, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("tokens", [64, 333])
+def test_mlp_replay_matches_pytorch(tokens, monkeypatch):
+    """The recompute's MLP stand-in (gustash.py): the input gradient of
+    down(silu(gate(x)) * up(x)) from the saved gate/up, against plain autograd. Dense fp16 weights
+    stand in for the NF4 ones (the dequantization has its own test)."""
+    from types import SimpleNamespace
+
+    from solution import gustash
+
+    torch.manual_seed(0)
+    hidden, inter = 256, 1000
+    w_gate = (torch.randn(inter, hidden, device="cuda") / hidden ** 0.5).half()
+    w_up = (torch.randn(inter, hidden, device="cuda") / hidden ** 0.5).half()
+    w_down = (torch.randn(hidden, inter, device="cuda") / inter ** 0.5).half()
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.float16, requires_grad=True)
+    grad = torch.randn(tokens, hidden, device="cuda", dtype=torch.float16)
+
+    gate, up = x @ w_gate.t(), x @ w_up.t()
+    ref = (torch.nn.functional.silu(gate.float()) * up.float()).half() @ w_down.t()
+    ref.backward(grad)
+    ref_dx = x.grad.float()
+    x.grad = None
+
+    monkeypatch.setattr(gustash, "nf4_dequantize", lambda packed, state: state.dense)
+    states = [SimpleNamespace(dense=w, shape=tuple(w.shape)) for w in (w_gate, w_up, w_down)]
+    packed = [torch.empty(1, device="cuda") for _ in range(3)]
+    out = gustash._MlpReplay.apply(x, gate.detach().clone(), up.detach().clone(), *packed, *states)
+    assert out.shape == (tokens, hidden) and out.dtype == torch.float16
+    out.backward(grad)
+    torch.testing.assert_close(x.grad.float(), ref_dx, rtol=2e-2, atol=2e-2)

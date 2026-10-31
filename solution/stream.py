@@ -23,11 +23,17 @@ streaming is switched off, so a surprise costs memory, not correctness.
 
 import torch
 
-from .mode import STREAMED_FORWARD
+from .mode import GU, STREAMED_FORWARD
 
 ENABLED = True
 OFFLOAD_INPUTS = True  # the layer inputs kept for the backward also go to pinned CPU memory
 PREFETCH_DEPTH = 1
+# The MLP's [gate, up] of every layer goes to pinned CPU memory in the forward and comes back in the
+# backward, so the recompute does not repeat the gate/up/down GEMMs (gustash.py). It is used only if
+# a short copy test at the first step shows a PCIe bus of at least GU_MIN_GBPS in both directions.
+GU_STASH = True
+GU_MIN_GBPS = 8.0
+GU_INFLIGHT = 1  # layers whose gate/up copy to the host may still be running when the next starts
 ALIGN = 256  # byte alignment of each tensor inside a layer's packed buffer
 # the packed weights and the per-block scales; `offset` (one scalar) and `code` (256 values) stay on
 # the GPU: bitsandbytes reads them with .item() when it serializes the quantization state
@@ -105,11 +111,39 @@ def restore_all():
     _STATE["manager"] = None
 
 
+def _bus_gbps():
+    """Host-to-device and device-to-host GB/s of pinned copies (32 MB, 4 times each)."""
+    size = 32 << 20
+    host = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+    dev = torch.empty(size, dtype=torch.uint8, device="cuda")
+    dev.copy_(host, non_blocking=True)
+    host.copy_(dev, non_blocking=True)
+    torch.cuda.synchronize()
+    speeds = []
+    for to_device in (True, False):
+        start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(4):
+            if to_device:
+                dev.copy_(host, non_blocking=True)
+            else:
+                host.copy_(dev, non_blocking=True)
+        stop.record()
+        stop.synchronize()
+        speeds.append(4 * size / (start.elapsed_time(stop) * 1e-3) / 1e9)
+    del dev, host
+    torch.cuda.empty_cache()  # the test buffer must not stay in the allocator's reserve
+    return speeds
+
+
 class LayerManager:
     """Fetches and drops the offloaded weights of one decoder layer at a time: one pinned arena
     for all layers, one host-to-device copy per layer, views into it for each tensor."""
 
     def __init__(self, layers):
+        from .timeline import mark
+
+        mark("layer manager: packing the 4-bit weights into pinned memory")
         self.groups, self.spans = [], []
         total = 0
         for layer in layers:
@@ -144,6 +178,22 @@ class LayerManager:
         self.views = {}  # (layer, ring buffer) -> views of the layer's tensors in that buffer
         self.pending = []  # (layer input, event) whose copy to the host is still running
         self.inputs = {}  # layer -> {"host": (pinned copy, event), "gpu": (tensor, event) or None}
+        self.gu = {}  # layer -> {"host": (gate, up, event), "gpu": (gate, up, event) or None}
+        self.gu_pending = []  # (gate, up, event): GPU tensors whose copy to the host is running
+        self.gu_on = False
+        self.gu_side = None  # its own stream: the copies do not queue behind the weight prefetch
+        if GU_STASH:
+            try:
+                up, down = _bus_gbps()
+            except Exception as exc:  # noqa: BLE001 - no stash, the recompute does everything
+                up = down = 0.0
+                print(f"[gu] bus test failed: {exc!r}", flush=True)
+            self.gu_on = min(up, down) >= GU_MIN_GBPS
+            if self.gu_on:
+                self.gu_side = torch.cuda.Stream()
+            print(f"[gu] PCIe {up:.1f} GB/s to the GPU, {down:.1f} GB/s back -> gate/up stash "
+                  f"{'on' if self.gu_on else 'off'}", flush=True)
+        mark("layer manager ready")
 
     def _holder(self, buffer):
         for layer, held in self.where.items():
@@ -239,6 +289,70 @@ class LayerManager:
             ready.record(self.side)
         entry["gpu"] = (gpu, ready)
 
+    def gu_stash(self, index, gate, up):
+        """Async copy of a layer's gate/up outputs to pinned memory on the side stream. The GPU
+        tensors stay referenced until their copy is done; at most GU_INFLIGHT layers wait for it,
+        so the CPU running ahead of the GPU cannot pile them up."""
+        self.gu_prune()
+        while len(self.gu_pending) >= GU_INFLIGHT:
+            self.gu_pending.pop(0)[2].synchronize()
+        host_gate = torch.empty(gate.shape, dtype=gate.dtype, pin_memory=True)
+        host_up = torch.empty(up.shape, dtype=up.dtype, pin_memory=True)
+        done = torch.cuda.Event()
+        self.gu_side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.gu_side):
+            host_gate.copy_(gate, non_blocking=True)
+            host_up.copy_(up, non_blocking=True)
+            done.record(self.gu_side)
+        self.gu_pending.append((gate, up, done))
+        self.gu[index] = {"host": (host_gate, host_up, done), "gpu": None}
+
+    def gu_prune(self):
+        self.gu_pending = [item for item in self.gu_pending if not item[2].query()]
+
+    def gu_drain(self):
+        """End of the forward: wait for the last copies, so that no layer's gate/up stays on the
+        GPU through the head and the backward."""
+        while self.gu_pending:
+            self.gu_pending.pop(0)[2].synchronize()
+
+    def gu_drop(self, index):
+        self.gu.pop(index, None)
+
+    def gu_prefetch(self, index):
+        """Start copying layer `index`'s gate/up back while the layer above backpropagates."""
+        self.gu_prune()
+        entry = self.gu.get(index)
+        if entry is None or entry["gpu"] is not None:
+            return
+        host_gate, host_up, done = entry["host"]
+        gate = torch.empty(host_gate.shape, dtype=host_gate.dtype, device="cuda")
+        up = torch.empty_like(gate)
+        # the blocks may have been freed by main-stream work still queued: let that finish first
+        self.gu_side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.gu_side):
+            self.gu_side.wait_event(done)
+            gate.copy_(host_gate, non_blocking=True)
+            up.copy_(host_up, non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record(self.gu_side)
+        entry["gpu"] = (gate, up, ready)
+
+    def gu_take(self, index, rows):
+        """The layer's (gate, up) on the GPU, ready on the current stream; None if there is no
+        stash for it or it was made for another number of tokens."""
+        entry = self.gu.get(index)
+        if entry is None:
+            return None
+        if entry["host"][0].shape[0] != rows:
+            del self.gu[index]
+            return None
+        self.gu_prefetch(index)
+        del self.gu[index]
+        gate, up, ready = entry["gpu"]
+        torch.cuda.current_stream().wait_event(ready)
+        return gate, up
+
     def take_input(self, index, host):
         entry = self.inputs.pop(index, None)
         if entry is not None and entry["host"] is host and entry["gpu"] is not None:
@@ -275,12 +389,17 @@ class _Streamed(torch.autograd.Function):
         # norm / SwiGLU functions keep their fast path here (mode.py), so this computes what the
         # recompute does, with the same kernels and dropout seeds
         STREAMED_FORWARD[0] = True
+        GU.update(manager=manager, index=index, mode="capture" if manager.gu_on else None)
         try:
             with torch.no_grad():
                 out = holder.run(hidden)
         finally:
             STREAMED_FORWARD[0] = False
-        manager.release(index, keep=index + 1 == len(manager.groups))
+            GU["mode"] = None
+        last = index + 1 == len(manager.groups)
+        if last and manager.gu_on:
+            manager.gu_drain()
+        manager.release(index, keep=last)
         ctx.holder, ctx.needs_grad = holder, hidden.requires_grad
         if OFFLOAD_INPUTS:
             ctx.host = manager.stash_input(index, hidden.detach())
@@ -302,9 +421,15 @@ class _Streamed(torch.autograd.Function):
         manager.fetch(index, -1)
         if OFFLOAD_INPUTS:
             manager.prefetch_input(index - 1)
+        if manager.gu_on:
+            manager.gu_prefetch(index - 1)
         with torch.enable_grad():
             states = hidden.detach().requires_grad_(ctx.needs_grad)
-            out = holder.run(states)
+            GU.update(manager=manager, index=index, mode="replay" if manager.gu_on else None)
+            try:
+                out = holder.run(states)
+            finally:
+                GU["mode"] = None
             params = holder.params
             inputs = ([states] if states.requires_grad else []) + params
             grads = torch.autograd.grad(out, inputs, grad_out, allow_unused=True)

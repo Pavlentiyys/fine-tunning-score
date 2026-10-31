@@ -21,6 +21,10 @@ import torch
 
 EMBEDDING_ON_CPU = True
 NO_ALLOCATOR_WARMUP = True
+# transformers materializes each checkpoint tensor with one blocking `tensor.to(cuda, fp16)`, for
+# which PyTorch converts bf16 -> fp16 on the CPU (~3 GB on Kaggle's few cores). Copying the bf16
+# tensor first and converting on the GPU gives the same bits; one tensor is briefly there twice.
+CONVERT_ON_GPU = True
 VOCAB, HIDDEN = 151936, 1536  # Qwen2.5-1.5B's tied embedding: the one tensor of this shape
 
 # what happened to the embedding while loading; printed with the first [mem] line of training
@@ -71,6 +75,10 @@ def patch_embedding_load_to_cpu():
             LOAD_EVENTS["embedding materialized on cpu"] += 1
             print(f"[load] tied embedding kept in CPU memory (was bound for {device})", flush=True)
             return tensor.to(dtype=dtype or torch.float16)
+        if (CONVERT_ON_GPU and device is not None and torch.device(device).type == "cuda"
+                and dtype is not None and tensor.dtype != dtype and tensor.is_floating_point()
+                and dtype.is_floating_point):
+            return tensor.to(device=device).to(dtype)
         return original(tensor, device, dtype)
 
     core_model_loading._materialize_copy = materialize
