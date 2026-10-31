@@ -65,7 +65,8 @@ def patch_dataset_map_fingerprint():
 # - every thread that calls cuBLAS gets its own workspace (~8 MiB each by default). `:16:8`
 #   (eight 16 KiB chunks) is one of the two sizes cuBLAS documents for reproducible results.
 CUDA_STACK_BYTES = 16
-CUBLAS_WORKSPACE = ":16:8"
+# measured: ":16:8" saved ~20 MiB but made the loop ~3 s slower (cuBLAS picks slower GEMMs)
+CUBLAS_WORKSPACE = ""
 
 
 def shrink_cuda_reserves():
