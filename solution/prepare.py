@@ -43,6 +43,29 @@ def patch_embedding_load_to_cpu():
 
     core_model_loading._materialize_copy = materialize
 
+    # After loading, transformers calls accelerate's `dispatch_model`, which for a single-GPU device
+    # map runs `model.to(device)` and would carry the CPU embedding to the GPU after all. The
+    # embedding's data is swapped for an empty CPU tensor during that call and put back after.
+    from transformers import modeling_utils
+    from transformers.integrations import accelerate as hf_accelerate
+
+    dispatch = hf_accelerate.accelerate_dispatch
+
+    def accelerate_dispatch(model, *args, **kwargs):
+        weight = getattr(model.get_input_embeddings(), "weight", None)
+        if weight is None or weight.is_cuda:
+            return dispatch(model, *args, **kwargs)
+        kept = weight.data
+        weight.data = torch.empty(0, dtype=kept.dtype)
+        try:
+            return dispatch(model, *args, **kwargs)
+        finally:
+            weight.data = kept
+            print(f"[load] embedding kept on {weight.device} through dispatch_model", flush=True)
+
+    hf_accelerate.accelerate_dispatch = accelerate_dispatch
+    modeling_utils.accelerate_dispatch = accelerate_dispatch
+
     # `model.device` is the first parameter's device, which is now the CPU embedding; anything
     # that places inputs by it must still see the GPU the rest of the model is on
     device_property = PreTrainedModel.device

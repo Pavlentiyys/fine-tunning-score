@@ -131,7 +131,7 @@ def patch_qwen2_model():
         _embedding_to_fp16(self)
         _STEPS[0] += 1
         if _STEPS[0] in (1, 2, 3, 10):
-            _mem(f"forward call {_STEPS[0]}")
+            _mem(f"forward call {_STEPS[0]} (embedding on {self.embed_tokens.weight.device})")
         batch, seq = input_ids.shape
         flat_len = batch * seq
         rows = attention_mask.reshape(-1).nonzero().squeeze(1)
