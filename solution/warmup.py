@@ -23,6 +23,9 @@ import threading
 import torch
 
 LOAD_LAUNCHERS = True
+# cuBLAS and SDPA's memory-efficient attention load their libraries and kernels at the first call,
+# inside the first training step; a few small calls of the training's kinds load them here instead
+WARM_LIBRARIES = True
 HIDDEN, INTER, VOCAB, HEAD_DIM = 1536, 8960, 151936, 128
 Q_HEADS, KV_HEADS = 12, 2
 
@@ -116,6 +119,24 @@ def _load_all(ready):
     return loaded
 
 
+def _warm_libraries():
+    f16 = torch.float16
+    x = torch.randn(256, HIDDEN, device="cuda", dtype=f16)
+    w = torch.randn(INTER, HIDDEN, device="cuda", dtype=f16)
+    h = x @ w.t()
+    y = torch.addmm(h @ w, h, w)
+    q, k, v = (torch.randn(1, Q_HEADS, 64, HEAD_DIM, device="cuda", dtype=f16, requires_grad=True)
+               for _ in range(3))
+    out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+    out.backward(torch.ones_like(out))
+    torch.cuda.synchronize()
+    del x, w, h, y, q, k, v, out
+    clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+    if clear is not None:
+        clear()  # this thread's cuBLAS workspace must not stay allocated
+    torch.cuda.empty_cache()
+
+
 def _safe_compile():
     import time
 
@@ -132,8 +153,16 @@ def _safe_compile():
         return
     compiled = time.perf_counter() - started
     loaded = _load_all(ready) if LOAD_LAUNCHERS else 0
+    prepared = time.perf_counter() - started
     print(f"[warmup] Triton kernels compiled in {compiled:.1f} s, {loaded} launchers built and "
-          f"loaded in {time.perf_counter() - started - compiled:.1f} s more", flush=True)
+          f"loaded in {prepared - compiled:.1f} s more", flush=True)
+    if WARM_LIBRARIES:
+        try:
+            _warm_libraries()
+            print(f"[warmup] cuBLAS / SDPA loaded in {time.perf_counter() - started - prepared:.1f} s",
+                  flush=True)
+        except Exception as exc:  # noqa: BLE001 - they load at the first step instead
+            print(f"[warmup] cuBLAS / SDPA not loaded: {exc!r}", flush=True)
 
 
 _THREAD = []

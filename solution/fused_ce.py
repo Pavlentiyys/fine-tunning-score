@@ -409,7 +409,10 @@ def _head_weight16(lm_head):
 def _pinned(weight):
     """The CPU head / embedding weight in pinned memory (once), for async chunk copies."""
     if not weight.data.is_pinned():
-        weight.data = weight.data.pin_memory()
+        from .stream import take_pinned
+
+        pinned = take_pinned(weight)  # pinned right after loading (stream.start_prepack)
+        weight.data = pinned if pinned is not None else weight.data.pin_memory()
     return weight.detach()
 
 

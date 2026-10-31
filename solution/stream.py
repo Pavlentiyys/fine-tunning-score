@@ -97,10 +97,14 @@ def offload_param(param):
 def restore_all():
     """Copy every offloaded tensor back to the GPU and stop streaming (the safe way out)."""
     _STATE["disabled"] = True
+    _join_prepack()
     manager = _STATE["manager"]
-    if manager is not None:  # packed: each layer's slots are views into its span of the arena
-        for slots, (start, stop) in zip(manager.groups, manager.spans):
-            span = manager.arena[start:stop].to("cuda")
+    packed = ((manager.groups, manager.spans, manager.arena) if manager is not None
+              else _PREPACK["result"])
+    if packed is not None:  # packed: each layer's slots are views into its span of the arena
+        groups, spans, arena = packed
+        for slots, (start, stop) in zip(groups, spans):
+            span = arena[start:stop].to("cuda")
             for slot in slots:
                 slot.set(slot.view_in(span).clone())
     else:
@@ -109,6 +113,130 @@ def restore_all():
                 slot.set(slot.cpu.to(slot.device))
     _REGISTRY.clear()
     _STATE["manager"] = None
+    _PREPACK["result"] = None
+
+
+def _groups(layers):
+    """The offloaded slots of each layer; LookupError if a 4-bit weight was not offloaded."""
+    groups = []
+    for layer in layers:
+        slots = []
+        for param in layer.parameters():
+            if param.__class__.__name__ == "Params4bit":
+                entry = _REGISTRY.get(id(param))
+                if entry is None:
+                    raise LookupError("a 4-bit weight was not offloaded")
+                slots += entry[1]
+        groups.append(slots)
+    return groups
+
+
+def _pack(groups):
+    """Each layer's offloaded tensors, laid out one after another in one pinned arena:
+    (slots per layer, (start, stop) per layer, arena). The slots keep their CPU copies until
+    every copy is done."""
+    spans, total = [], 0
+    for slots in groups:
+        start = total
+        for slot in slots:
+            slot.offset = total - start
+            total += -(-slot.nbytes // ALIGN) * ALIGN
+        spans.append((start, total))
+    arena = torch.empty(total, dtype=torch.uint8, pin_memory=True)
+    for slots, (start, _stop) in zip(groups, spans):
+        for slot in slots:
+            arena[start + slot.offset:start + slot.offset + slot.nbytes].copy_(
+                slot.cpu.reshape(-1).view(torch.uint8))
+    for slots in groups:
+        for slot in slots:
+            slot.cpu = None
+    return groups, spans, arena
+
+
+# Packing the arena (~655 MB pinned) and pinning the CPU embedding (467 MB) took ~1 s of the first
+# training step. Both only need the loaded model, so a thread does them right after loading, while
+# Soup prepares the model, the data and the trainer; the first step (or anything that needs the
+# weights before it) joins the thread first.
+PREPACK = True
+_PREPACK = {"thread": None, "layers": None, "result": None, "error": None, "pinned": {}}
+
+
+def _prepack_job(groups, embedding):
+    try:
+        if embedding is not None:
+            key, data = embedding
+            _PREPACK["pinned"][key] = (data.data_ptr(), data.pin_memory())
+        _PREPACK["result"] = _pack(groups)
+    except Exception as exc:  # noqa: BLE001 - handled where the result is taken
+        _PREPACK["error"] = exc
+
+
+def start_prepack(model):
+    if not (PREPACK and ENABLED and _REGISTRY and not _STATE["disabled"]
+            and _PREPACK["thread"] is None and torch.cuda.is_available()):
+        return
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is None:
+        return
+    try:  # collected here: the model's modules change (peft) while the thread runs
+        groups = _groups(layers)
+    except LookupError:
+        return  # the first forward finds the same problem and restores the weights
+    embedding = None
+    try:
+        weight = model.get_input_embeddings().weight
+        if not weight.is_cuda and not weight.data.is_pinned():
+            embedding = (id(weight), weight.data)
+    except Exception:  # noqa: BLE001 - nothing to pin
+        pass
+    import threading
+
+    _PREPACK["layers"] = [id(layer) for layer in layers]
+    thread = threading.Thread(target=_prepack_job, args=(groups, embedding),
+                              name="soup-prepack", daemon=False)
+    _PREPACK["thread"] = thread
+    thread.start()
+
+
+def _join_prepack():
+    thread = _PREPACK["thread"]
+    if thread is not None and thread.is_alive():
+        thread.join()
+
+
+def take_prepacked(layers):
+    """The arena packed after loading if it was packed for these layers, else None."""
+    _join_prepack()
+    if _PREPACK["error"] is not None:
+        error, _PREPACK["error"] = _PREPACK["error"], None
+        if isinstance(error, LookupError):
+            raise error
+        print(f"[load] packing after loading failed, packing now: {error!r}", flush=True)
+        return None
+    result = _PREPACK["result"]
+    if result is None:
+        return None
+    _PREPACK["result"] = None
+    if _PREPACK["layers"] != [id(layer) for layer in layers]:
+        # packed for other layer modules: give the slots their CPU copies back and pack again
+        groups, spans, arena = result
+        for slots, (start, stop) in zip(groups, spans):
+            for slot in slots:
+                slot.cpu = slot.view_in(arena[start:stop]).clone()
+        return None
+    return result
+
+
+def take_pinned(weight):
+    """A pinned copy of `weight` made after loading, if its data is still the one copied."""
+    _join_prepack()
+    entry = _PREPACK["pinned"].pop(id(weight), None)
+    if entry is None or entry[0] != weight.data.data_ptr():
+        return None
+    pinned = entry[1]
+    if pinned.shape != weight.data.shape or pinned.dtype != weight.data.dtype:
+        return None
+    return pinned
 
 
 def _bus_gbps():
@@ -143,29 +271,11 @@ class LayerManager:
     def __init__(self, layers):
         from .timeline import mark
 
-        mark("layer manager: packing the 4-bit weights into pinned memory")
-        self.groups, self.spans = [], []
-        total = 0
-        for layer in layers:
-            slots = []
-            for param in layer.parameters():
-                if param.__class__.__name__ == "Params4bit":
-                    entry = _REGISTRY.get(id(param))
-                    if entry is None:
-                        raise LookupError("a 4-bit weight was not offloaded")
-                    slots += entry[1]
-            start = total
-            for slot in slots:
-                slot.offset = total - start
-                total += -(-slot.nbytes // ALIGN) * ALIGN
-            self.groups.append(slots)
-            self.spans.append((start, total))
-        self.arena = torch.empty(total, dtype=torch.uint8, pin_memory=True)
-        for slots, (start, _stop) in zip(self.groups, self.spans):
-            for slot in slots:
-                self.arena[start + slot.offset:start + slot.offset + slot.nbytes].copy_(
-                    slot.cpu.reshape(-1).view(torch.uint8))
-                slot.cpu = None
+        mark("layer manager: taking the packed 4-bit weights")
+        packed = take_prepacked(layers)
+        if packed is None:
+            packed = _pack(_groups(layers))
+        self.groups, self.spans, self.arena = packed
         # a ring of persistent GPU buffers, allocated once on the main stream: the side stream only
         # copies into them, so no blocks are owned by the side stream's pool and no frees are
         # deferred by record_stream (both made the allocator reserve ~2x what was alive)
@@ -473,3 +583,15 @@ def patch_bnb_offload():
         return result
 
     bnb.nn.Params4bit._quantize = _quantize
+
+    import transformers
+
+    auto = transformers.AutoModelForCausalLM
+    load = auto.from_pretrained.__func__
+
+    def from_pretrained(cls, *args, **kwargs):
+        model = load(cls, *args, **kwargs)
+        start_prepack(model)
+        return model
+
+    auto.from_pretrained = classmethod(from_pretrained)
