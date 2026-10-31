@@ -14,6 +14,7 @@ The rules in short (the README and the task statement have the full ones):
 """
 
 from .dequant import patch_bnb_matmul_4bit
+from .nf4 import patch_bnb_dequantize_4bit
 from .warmup import start_background_compile
 from .timeline import mark, patch_timeline
 from .stream import patch_bnb_offload
@@ -30,6 +31,7 @@ def apply():
     patch_timeline()  # [time] lines in train.log: load / train / save split (prints only)
     start_background_compile()  # our kernels compile while Soup loads the model
     patch_bnb_matmul_4bit()  # NF4 weight dequantized once for recompute + backward
+    patch_bnb_dequantize_4bit()  # NF4 + double-quant scales in one Triton kernel
     patch_bnb_offload()  # 4-bit weights go to pinned CPU memory as they are quantized
     patch_no_allocator_warmup()  # no model-sized reservation before loading (it was the peak)
     patch_embedding_load_to_cpu()  # the tied embedding / lm_head is loaded to (pinned) CPU memory

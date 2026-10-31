@@ -35,6 +35,32 @@ class _Linear4bitDequantOnce(torch.autograd.Function):
         return grad.to(weight.dtype) @ weight, None, None, None
 
 
+class _Linear4bitNF4(torch.autograd.Function):
+    """With streamed weights: our NF4 kernel in forward and again in backward (the packed weight
+    is what is kept, as bitsandbytes' MatMul4Bit keeps it), one launch per dequantization
+    instead of bitsandbytes' absmax dequant + offset add + NF4 lookup."""
+
+    @staticmethod
+    def forward(ctx, a, packed, bias, quant_state):
+        from .nf4 import nf4_dequantize
+
+        if bias is not None and bias.dtype != a.dtype:
+            bias = bias.to(a.dtype)  # what bitsandbytes' Linear4bit / autocast do with an fp32 bias
+        out = torch.nn.functional.linear(a, nf4_dequantize(packed, quant_state), bias)
+        if ctx.needs_input_grad[0]:
+            ctx.save_for_backward(packed)
+            ctx.quant_state = quant_state
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        from .nf4 import nf4_dequantize
+
+        (packed,) = ctx.saved_tensors
+        weight = nf4_dequantize(packed, ctx.quant_state)
+        return grad.to(weight.dtype) @ weight, None, None, None
+
+
 def patch_bnb_matmul_4bit():
     import bitsandbytes as bnb
 
@@ -53,6 +79,17 @@ def patch_bnb_matmul_4bit():
             lead = A.shape[:-1]
             result = _Linear4bitDequantOnce.apply(A.reshape(-1, A.shape[-1]), B, bias, quant_state)
             return result.view(*lead, result.shape[-1])
+        if (streaming() and out is None and quant_state is not None and A.is_cuda
+                and A.dtype == torch.float16 and A.dim() >= 2 and A.numel() > A.shape[-1]
+                and not (bias is not None and bias.requires_grad)):
+            from .nf4 import eligible
+
+            packed = B.reshape(-1, 1)
+            if eligible(packed, quant_state):
+                lead = A.shape[:-1]
+                result = _Linear4bitNF4.apply(A.reshape(-1, A.shape[-1]), packed, bias,
+                                              quant_state)
+                return result.view(*lead, result.shape[-1])
         return original(A, B, quant_state=quant_state, out=out, bias=bias)
 
     bnb.matmul_4bit = matmul_4bit

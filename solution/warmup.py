@@ -61,6 +61,13 @@ def _compile_all():
         make(f32), make(f32), make(i32), make(f32), make(f32), 100, BLOCK_V=fused_ce.BLOCK_V,
         num_warps=8, grid=grid)
 
+    from . import nf4
+
+    nf4.soup_nf4_dequant_kernel.warmup(
+        make(torch.uint8), make(torch.uint8), make(f32, 256), make(f32), make(f32), make(f32),
+        make(f16, 32), 1536, BLOCK=nf4.BLOCK, BYTES_PER_SCALE=32, SCALES_PER_SCALE2=256,
+        num_warps=nf4.WARPS, grid=grid)
+
     from .prepare import EMBEDDING_ON_CPU
 
     # the GPU-resident head kernel only runs when the embedding is not kept on the CPU
@@ -82,7 +89,31 @@ def _safe_compile():
     print(f"[warmup] Triton kernels compiled in {time.perf_counter() - started:.1f} s", flush=True)
 
 
+_THREAD = []
+
+
 def start_background_compile():
     if not torch.cuda.is_available():
         return
-    threading.Thread(target=_safe_compile, name="soup-triton-warmup", daemon=True).start()
+    # not a daemon: the interpreter waits for it at exit instead of killing it mid-compile
+    thread = threading.Thread(target=_safe_compile, name="soup-triton-warmup", daemon=False)
+    thread.start()
+    _THREAD.append(thread)
+    _join_at_first_step()
+
+
+def _join_at_first_step():
+    """Join the compile thread when the first training step starts, before our first kernel
+    launch, so the training never compiles a kernel the thread is still compiling."""
+    try:
+        import transformers
+    except Exception:  # noqa: BLE001 - no transformers (fake modules in tests): nothing to hook
+        return
+    original = transformers.Trainer.training_step
+
+    def training_step(self, *args, **kwargs):
+        while _THREAD:
+            _THREAD.pop().join(900)
+        return original(self, *args, **kwargs)
+
+    transformers.Trainer.training_step = training_step

@@ -183,8 +183,7 @@ def patch_qwen2_model():
                        kwargs):
             if _REGISTRY:
                 restore_all()
-            if not self.training:
-                _embedding_to_gpu(self)
+            _embedding_to_gpu(self)  # the original forward needs the (tied) embedding on the GPU
             return original(self, input_ids=input_ids, attention_mask=attention_mask,
                             position_ids=position_ids, past_key_values=past_key_values,
                             inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
