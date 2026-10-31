@@ -87,8 +87,56 @@ def _usable(model, input_ids, attention_mask, past_key_values, inputs_embeds, us
             and not kwargs.get("output_attentions"))
 
 
+# Attention one row at a time on the real tokens, causal, without any padding (see _attention_rows)
+PER_ROW_ATTENTION = True
+
+
+class _Rows:
+    """The real tokens of each row, in the unpadded stream: row lengths, and the RoPE tables
+    gathered at every real token's own position (shared by all layers of one forward)."""
+
+    def __init__(self, lens, cos, sin):
+        self.lens, self.cos, self.sin = lens, cos, sin
+
+
+def _attention_rows(attn, normed, layout):
+    """Qwen2Attention.forward without padding. Each row's real tokens are contiguous in the
+    unpadded stream, so a row is a slice: q/k/v are projected for the real tokens only, rotated at
+    their positions, and attend causally within their row, which is exactly what the causal +
+    padding mask allowed for every real token. The attention work is sum(L_row^2) instead of
+    batch * L_max^2, and no padded tensor is built. K/V heads are repeated as transformers'
+    `repeat_kv` does and SDPA is called without a mask and without `enable_gqa` (on a T4 that would
+    fall back to the math kernel), so it runs the memory-efficient causal kernel."""
+    from transformers.models.qwen2 import modeling_qwen2
+
+    heads = attn.config.num_attention_heads
+    kv_heads = attn.config.num_key_value_heads
+    dim, groups = attn.head_dim, heads // kv_heads
+    query, key, value = attn.q_proj(normed), attn.k_proj(normed), attn.v_proj(normed)
+    outs, start = [], 0
+    for length in layout.lens:
+        if length == 0:
+            continue
+        stop = start + length
+        q = query[start:stop].view(1, length, heads, dim).transpose(1, 2)
+        k = key[start:stop].view(1, length, kv_heads, dim).transpose(1, 2)
+        v = value[start:stop].view(1, length, kv_heads, dim).transpose(1, 2)
+        q, k = modeling_qwen2.apply_rotary_pos_emb(q, k, layout.cos[start:stop].unsqueeze(0),
+                                                   layout.sin[start:stop].unsqueeze(0))
+        if groups > 1:
+            k = k[:, :, None].expand(1, kv_heads, groups, length, dim).reshape(1, heads, length, dim)
+            v = v[:, :, None].expand(1, kv_heads, groups, length, dim).reshape(1, heads, length, dim)
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=length > 1,
+                                                               scale=attn.scaling)
+        outs.append(out.transpose(1, 2).reshape(length, heads * dim))
+        start = stop
+    return attn.o_proj(torch.cat(outs) if len(outs) > 1 else outs[0])
+
+
 def _attention(attn, normed, rows, flat_len, shape, mask, position_embeddings, kwargs):
     """Qwen2Attention.forward with the projections on the real tokens only."""
+    if isinstance(mask, _Rows):
+        return _attention_rows(attn, normed, mask)
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
     from transformers.models.qwen2 import modeling_qwen2
 
@@ -173,15 +221,28 @@ def patch_qwen2_model():
                 batch, seq, weight.shape[1])
         if position_ids is None:
             position_ids = torch.arange(seq, device=input_ids.device).unsqueeze(0)
-        mask_kwargs = {"config": self.config, "inputs_embeds": embeds,
-                       "attention_mask": attention_mask, "past_key_values": None,
-                       "position_ids": position_ids}
-        masks = {"full_attention": create_causal_mask(**mask_kwargs)}
-        if self.has_sliding_layers:
-            masks["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
         position_embeddings = self.rotary_emb(embeds, position_ids)
-
         layers = self.layers[: self.config.num_hidden_layers]
+        per_row = (PER_ROW_ATTENTION and self.config._attn_implementation == "sdpa"
+                   and not self.has_sliding_layers
+                   and all(layer.self_attn.sliding_window is None
+                           and not (layer.self_attn.training and layer.self_attn.attention_dropout)
+                           for layer in layers))
+        if per_row:
+            cos, sin = position_embeddings
+            batch_of = rows // seq if cos.shape[0] > 1 else torch.zeros_like(rows)
+            col_of = rows % seq
+            layout = _Rows(attention_mask.sum(dim=1).tolist(), cos[batch_of, col_of].contiguous(),
+                           sin[batch_of, col_of].contiguous())
+            masks = {"full_attention": layout}
+        else:
+            mask_kwargs = {"config": self.config, "inputs_embeds": embeds,
+                           "attention_mask": attention_mask, "past_key_values": None,
+                           "position_ids": position_ids}
+            masks = {"full_attention": create_causal_mask(**mask_kwargs)}
+            if self.has_sliding_layers:
+                masks["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+
         manager = get_manager(layers) if self.training else None
         for i, layer in enumerate(layers):
             args = (layer, rows, flat_len, (batch, seq), masks[self.config.layer_types[i]],

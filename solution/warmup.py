@@ -61,7 +61,10 @@ def _compile_all():
         make(f32), make(f32), make(i32), make(f32), make(f32), 100, BLOCK_V=fused_ce.BLOCK_V,
         num_warps=8, grid=grid)
 
-    for write_grad in (False, True):
+    from .prepare import EMBEDDING_ON_CPU
+
+    # the GPU-resident head kernel only runs when the embedding is not kept on the CPU
+    for write_grad in (() if EMBEDDING_ON_CPU else (False, True)):
         fused_ce.soup_ce_rows_kernel.warmup(
             make(f16), VOCAB, make(i32), make(f32), make(f32), make(i32), VOCAB,
             WRITE_GRAD=write_grad, BLOCK_V=fused_ce.BLOCK_V, num_warps=8, grid=grid)

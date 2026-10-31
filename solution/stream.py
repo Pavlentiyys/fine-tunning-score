@@ -140,6 +140,7 @@ class LayerManager:
         self.ring_free = [None] * len(self.ring)  # main-stream event: buffer no longer read
         self.where, self.ready = {}, {}  # layer -> ring buffer, layer -> copy-done event
         self.pending = []  # (layer input, event) whose copy to the host is still running
+        self.inputs = {}  # layer -> {"host": (pinned copy, event), "gpu": (tensor, event) or None}
 
     def _holder(self, buffer):
         for layer, held in self.where.items():
@@ -210,6 +211,35 @@ class LayerManager:
         stream.wait_event(done)
         return host.to("cuda", non_blocking=True)
 
+    def stash_input(self, index, tensor):
+        host = self.to_host(tensor)
+        self.inputs[index] = {"host": host, "gpu": None}
+        return host
+
+    def prefetch_input(self, index):
+        """Start copying layer `index`'s input back while the current layer backpropagates."""
+        entry = self.inputs.get(index)
+        if entry is None or entry["gpu"] is not None:
+            return
+        host, done = entry["host"]
+        gpu = torch.empty(host.shape, dtype=host.dtype, device="cuda")
+        # the block may have been freed by main-stream work still queued: let that finish first
+        self.side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.side):
+            self.side.wait_event(done)
+            gpu.copy_(host, non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record(self.side)
+        entry["gpu"] = (gpu, ready)
+
+    def take_input(self, index, host):
+        entry = self.inputs.pop(index, None)
+        if entry is not None and entry["host"] is host and entry["gpu"] is not None:
+            gpu, ready = entry["gpu"]
+            torch.cuda.current_stream().wait_event(ready)
+            return gpu
+        return self.from_host(*host)
+
 
 def get_manager(layers):
     """The manager, built once on the first forward; None when streaming is off."""
@@ -241,7 +271,7 @@ class _Streamed(torch.autograd.Function):
         manager.release(index, keep=index + 1 == len(manager.groups))
         ctx.holder, ctx.needs_grad = holder, hidden.requires_grad
         if OFFLOAD_INPUTS:
-            ctx.host = manager.to_host(hidden.detach())
+            ctx.host = manager.stash_input(index, hidden.detach())
         else:
             ctx.host = None
             ctx.save_for_backward(hidden)
@@ -253,11 +283,13 @@ class _Streamed(torch.autograd.Function):
         holder = ctx.holder
         manager, index = holder.manager, holder.index
         if ctx.host is not None:
-            hidden = manager.from_host(*ctx.host)
+            hidden = manager.take_input(index, ctx.host)
             ctx.host = None
         else:
             (hidden,) = ctx.saved_tensors
         manager.fetch(index, -1)
+        if OFFLOAD_INPUTS:
+            manager.prefetch_input(index - 1)
         with torch.enable_grad():
             states = hidden.detach().requires_grad_(ctx.needs_grad)
             out = holder.run(states)
