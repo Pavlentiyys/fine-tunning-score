@@ -29,17 +29,32 @@ RECOMPUTE_LAYERS = True
 SEEDS_PER_LAYER = 4  # LoRA dropout seeds a layer may draw (q_proj and v_proj use two)
 
 _EMBED_DONE = set()
+_STEPS = [0]
+
+
+def _mem(tag):
+    """One line in train.log: where the allocator's peaks come from (read only)."""
+    mib = 2**20
+    print(f"[mem] {tag}: allocated {torch.cuda.memory_allocated() / mib:.0f}, "
+          f"max allocated {torch.cuda.max_memory_allocated() / mib:.0f}, "
+          f"max reserved {torch.cuda.max_memory_reserved() / mib:.0f} MiB", flush=True)
 
 
 def _embedding_to_fp16(model):
-    """Once: the frozen (tied) input embedding in fp16; the freed fp32 copy goes back to the
-    allocator before the activations of the first step need room."""
+    """Once: the frozen (tied) input embedding in fp16. The fp32 weight goes through the CPU, so
+    the fp32 and fp16 copies are never on the GPU together: that moment lasted milliseconds, was
+    the allocator's peak, and nvidia-smi (100 ms samples) only sometimes saw it."""
     weight = model.embed_tokens.weight
     if id(weight) in _EMBED_DONE or weight.dtype != torch.float32 or weight.requires_grad:
         return
-    weight.data = weight.data.to(torch.float16)
+    _mem("before embedding to fp16")
+    half = weight.data.cpu().half()
+    weight.data = torch.empty(0, dtype=torch.float16, device=weight.device)
+    torch.cuda.empty_cache()
+    weight.data = half.to(weight.device)
     _EMBED_DONE.add(id(weight))
     torch.cuda.empty_cache()
+    _mem("after embedding to fp16")
 
 
 def _usable(model, input_ids, attention_mask, past_key_values, inputs_embeds, use_cache, kwargs):
@@ -101,6 +116,9 @@ def patch_qwen2_model():
                             position_ids=position_ids, past_key_values=past_key_values,
                             inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
         _embedding_to_fp16(self)
+        _STEPS[0] += 1
+        if _STEPS[0] in (1, 2, 3, 10):
+            _mem(f"forward call {_STEPS[0]}")
         batch, seq = input_ids.shape
         embeds = self.embed_tokens(input_ids)
         if embeds.dtype == torch.float16:
