@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-label="Larpers — Soup Kernel Challenge">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="1" stop-color="#1b1140"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse">
+      <path d="M30 0H0V30" fill="none" stroke="#ffffff" stroke-opacity="0.05"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="300" fill="url(#bg)"/>
+  <rect width="1200" height="300" fill="url(#grid)"/>
+  <g stroke="url(#accent)" stroke-width="2" fill="none" opacity="0.55">
+    <path d="M820 60h120l30 30h130"/>
+    <path d="M880 150h90l24 24h110"/>
+    <path d="M840 240h140l26-26h120"/>
+    <circle cx="1100" cy="90" r="5" fill="#22d3ee"/>
+    <circle cx="1104" cy="174" r="5" fill="#a78bfa"/>
+    <circle cx="1106" cy="214" r="5" fill="#22d3ee"/>
+  </g>
+  <text x="70" y="150" font-family="Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="96" font-weight="700" letter-spacing="6" fill="url(#accent)">LARPERS</text>
+  <text x="74" y="198" font-family="Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="26" fill="#e2e8f0">Soup Kernel Challenge · Decentrathon 6.0</text>
+  <text x="74" y="240" font-family="Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="20" fill="#94a3b8">Triton kernels · 14.3 GB → 0.5 GB on a Kaggle T4</text>
+</svg>

@@ -1,62 +1,94 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="LARPERS — Soup Kernel Challenge" width="100%">
+</p>
+
 # Submission: LARPERS
 
-## Links
-- Repository, final commit: https://github.com/BAITC-Hacks/hack-1b4f2831-larpers/commit/fb741edc4b98fb02990df0f059ac82da87bc1790
-- Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link must
-  be in your README):
+Soup Kernel Challenge, Decentrathon 6.0. Подробное описание решения, запуск и ограничения — в
+[`README.md`](README.md).
+
+## Ссылки
+- Репозиторий, финальный коммит: https://github.com/BAITC-Hacks/hack-1b4f2831-larpers/commit/fb741edc4b98fb02990df0f059ac82da87bc1790
+- Публичный Kaggle-ноутбук, сохранённая версия (`COMMIT` в нём = sha выше; та же ссылка есть
+  в README):
   https://www.kaggle.com/code/mirceya/kaggle-notebook?scriptVersionId=TODO
-- Demo video (up to 3 minutes): TODO
-- Presentation: TODO
+- Демо-видео (до 3 минут): TODO
+- Презентация: TODO
 
-## Team (up to 4 people)
-| Name | Role | GitHub | Kaggle | Contact (captain) |
+## Команда (до 4 человек)
+| Имя | Роль | GitHub | Kaggle | Контакт (капитан) |
 |---|---|---|---|---|
-| TODO | | | | |
+| Серік Азамат | разработчик | TODO | TODO | |
+| Пичугин Павел | разработчик | TODO | TODO | TODO |
 
-## Our kernels
-| Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
+## Что сделано (коротко)
+Фиксированный запуск `soup train` (Qwen2.5-1.5B-Instruct, NF4, LoRA r=16 на q/v, 64 шага, Kaggle T4)
+занимает ~0,5 ГБ видеопамяти вместо 14,3 ГБ и идёт быстрее базы при том же качестве адаптера.
+- **8 собственных Triton-кернелов** считают распаковку NF4, RMSNorm, SwiGLU, RoPE, LoRA-dropout и
+  слитую голову с кросс-энтропией.
+- **Система экономии памяти** вокруг них: 4-битные веса слоёв стримятся из pinned-памяти CPU,
+  слои пересчитываются в backward, паддинг не считается (attention построчный), эмбеддинг/голова
+  на 152 тыс. токенов живёт на CPU и идёт кусками по словарю.
+- Всё подключается одной функцией `solution.apply()`. Soup, данные, настройки LoRA и оптимизатор
+  не менялись.
+
+## Наши кернелы
+| Кернел (имя `@triton.jit`) | Файл | Что заменяет | Доля времени обучения (проверка 4) |
 |---|---|---|---|
-| `soup_nf4_dequant_kernel` | `solution/nf4.py` | bitsandbytes' NF4 dequantization with double-quantized scales (absmax dequant + offset add + NF4 lookup, three kernels) in the forward and backward of every 4-bit projection | 9.5 % |
-| `soup_lora_dropout_kernel` | `solution/lora.py` | `nn.Dropout` in peft's LoRA and its saved bool mask: the mask is regenerated from a Philox seed in the backward | 1.9 % |
-| `soup_mlp_fwd_kernel` | `solution/mlp.py` | `silu(gate) * up` (three PyTorch ops) | 1.7 % |
-| `soup_mlp_bwd_kernel` | `solution/mlp.py` | SwiGLU backward, written in place over the saved gate/up | 1.4 % |
-| `soup_rmsnorm_fwd_kernel` | `solution/rmsnorm.py` | Qwen2RMSNorm forward (fp32 in, fp16 out) | 1.3 % |
-| `soup_rope_kernel` | `solution/rope.py` | `apply_rotary_pos_emb` (six element-wise ops), forward and inverse rotation | 1.3 % |
-| `soup_ce_stream_kernel` | `solution/fused_ce.py` | lm_head logits + cross-entropy + entropy/argmax, online over streamed vocabulary chunks | 0.8 % |
-| `soup_rmsnorm_bwd_kernel` | `solution/rmsnorm.py` | RMSNorm backward from the saved fp16 normalized row | 0.5 % |
-| **all** | | | **18.3 %** |
+| `soup_nf4_dequant_kernel` | `solution/nf4.py` | распаковку NF4 в bitsandbytes с двойным квантованием масштабов (absmax dequant + прибавка offset + таблица NF4, три кернела) в forward и backward каждой 4-битной проекции | 9,5 % |
+| `soup_lora_dropout_kernel` | `solution/lora.py` | `nn.Dropout` в LoRA из peft и его сохранённую bool-маску: маска восстанавливается из seed Philox в backward | 1,9 % |
+| `soup_mlp_fwd_kernel` | `solution/mlp.py` | `silu(gate) * up` (три операции PyTorch) | 1,7 % |
+| `soup_mlp_bwd_kernel` | `solution/mlp.py` | backward SwiGLU, пишется поверх сохранённых gate/up | 1,4 % |
+| `soup_rmsnorm_fwd_kernel` | `solution/rmsnorm.py` | forward Qwen2RMSNorm (вход fp32, выход fp16) | 1,3 % |
+| `soup_rope_kernel` | `solution/rope.py` | `apply_rotary_pos_emb` (шесть поэлементных операций), прямой и обратный поворот | 1,3 % |
+| `soup_ce_stream_kernel` | `solution/fused_ce.py` | логиты lm_head + кросс-энтропия + энтропия/argmax, онлайн по кускам словаря, приходящим со стриминга | 0,8 % |
+| `soup_rmsnorm_bwd_kernel` | `solution/rmsnorm.py` | backward RMSNorm по сохранённой fp16-строке | 0,5 % |
+| **все вместе** | | | **18,3 %** (требование: ≥ 5 %) |
 
-`soup_ce_rows_kernel` (`solution/fused_ce.py`) is the fused head for a GPU-resident embedding; it
-does not run in the measured configuration (the embedding is kept in CPU memory).
+`soup_ce_rows_kernel` (`solution/fused_ce.py`) — слитая голова для эмбеддинга, лежащего на GPU. В
+замеряемой конфигурации он не запускается (эмбеддинг хранится в памяти CPU).
 
-Ideas taken from other kernels, with links (we wrote the code ourselves): chunked / fused linear
-cross-entropy (Liger-Kernel FusedLinearCrossEntropy, https://github.com/linkedin/Liger-Kernel;
-Cut Cross-Entropy, https://arxiv.org/abs/2411.09009), online softmax (Milakov & Gimelshein,
-https://arxiv.org/abs/1805.02867), NF4 data type (QLoRA, https://arxiv.org/abs/2305.14314;
-bitsandbytes' lookup table).
+Идеи, взятые из чужих кернелов (код мы писали сами): кусочная / слитая линейная кросс-энтропия
+(Liger-Kernel FusedLinearCrossEntropy, https://github.com/linkedin/Liger-Kernel; Cut Cross-Entropy,
+https://arxiv.org/abs/2411.09009), online softmax (Milakov & Gimelshein,
+https://arxiv.org/abs/1805.02867), тип данных NF4 (QLoRA, https://arxiv.org/abs/2305.14314;
+таблица значений из bitsandbytes). Полный список источников — в README.
 
-## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the notebook above)
-TODO: replace with the saved notebook version's run. Until then, our full run of this exact
-`solution/` (harness/run_task.py, base and solution in one session):
+## Результаты на Kaggle T4 (из `runs/result.json` и `runs/checks.json` ноутбука выше)
+TODO: заменить цифрами сохранённой версии ноутбука. Пока приведён наш полный запуск именно этого
+`solution/` (`harness/run_task.py`, база и решение в одной сессии):
 
-| | Base Soup | Ours | Ratio |
+| | Базовый Soup | Наше решение | Соотношение |
 |---|---|---|---|
-| Time of `soup train`, s | 86.43 | 67.94 | speedup 1.27x |
-| Peak GPU memory, MiB | 14 345 | 555 | base/ours 25.8x |
-| Eval loss (public rows) | 2.04965 | 2.04960 | −0.002 % vs base |
+| Время `soup train`, с | 86,43 | 67,94 | speedup 1,27x |
+| Пик памяти GPU, MiB | 14 345 | 555 | base/ours 25,8x |
+| Eval loss (открытые строки) | 2,04965 | 2,04960 | −0,002 % к базе |
 
-- [x] All 10 checks of `harness/check_rules.py` passed
-- [x] README.md rewritten for our solution: what we did, how to run it, results, limits
+- [x] Все 10 проверок `harness/check_rules.py` пройдены
+- [x] README.md переписан под наше решение: что сделано, как запустить, результаты, ограничения
 
-## Presentation covers
-Which operations we sped up and why, how the kernels work, results against the base (speed,
-memory, quality), limits and next steps.
+## Проверка по пунктам раздела 7 ТЗ
+| № | Требование | Статус |
+|---|---|---|
+| 1 | Запускается в чистом Kaggle-ноутбуке на T4 без правок | да, `templates/kaggle_notebook.ipynb`, «выполнить всё» |
+| 2 | Свои Triton-кернелы ≥ 5 % времени обучения с 3-го шага | да, 18,3 % |
+| 3 | Не хуже базы: loss ≤ +0,5 %, время и память ≤ +10 % | да: loss −0,002 %, время и память лучше базы |
+| 4 | Нет регрессий, 79 тестов Soup и `check_rules.py` проходят | да, 10 из 10 проверок |
+| 5 | README: что сделано, как запустить, результаты, ссылка на ноутбук | да (ссылка на ноутбук — после публикации) |
 
-## Limitations
-- The memory system (4-bit weights streamed from CPU memory, layer recompute, layer inputs and
-  the tied embedding in CPU memory, the 152k-row head streamed in vocabulary chunks) trades speed
-  for memory: without recompute and streaming the same kernels ran in ~51 s at ~3.7 GB.
-- Kaggle sessions differ by up to ~20 % in absolute speed (base 86–101 s in our runs); compare
-  the ratio to the base of the same session.
-- Per-row attention assumes right padding (TRL's default); other masks take the padded path.
-- T4 / fp16 path only; one GPU.
+## Презентация покрывает
+Какие операции мы ускоряли и почему (поэлементные операции и приведения типов, голова на 152 тыс.
+токенов, распаковка NF4, паддинг, активации всех слоёв), как устроены кернелы, результаты против базы
+(скорость, память, качество), ограничения и следующие шаги.
+
+## Ограничения
+- Система памяти (4-битные веса из памяти CPU, пересчёт слоёв, входы слоёв и связанный эмбеддинг
+  в памяти CPU, голова на 152 тыс. строк кусками по словарю) обменивает скорость на память: без
+  пересчёта и стриминга те же кернелы проходили задачу за ~51 с при ~3,7 ГБ.
+- Абсолютная скорость на Kaggle гуляет до ~20 % между сессиями (база у нас 86–101 с), поэтому
+  сравнивать нужно отношение к базе внутри одной сессии.
+- Покадровый attention предполагает правый паддинг (по умолчанию в TRL); для других масок
+  используется путь с паддингом.
+- Только путь T4 / fp16, одна видеокарта.
+- Следующие шаги: слить matmul с распаковкой NF4, чтобы убрать плотную копию весов; уменьшить цену
+  стриминга по PCIe за счёт более глубокой предвыборки.

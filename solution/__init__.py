@@ -16,6 +16,7 @@ The rules in short (the README and the task statement have the full ones):
 from .dequant import patch_bnb_matmul_4bit
 from .nf4 import patch_bnb_dequantize_4bit
 from .warmup import start_background_compile
+from .startup import patch_packages_distributions
 from .timeline import mark, patch_timeline
 from .stream import patch_bnb_offload
 from .prepare import patch_embedding_load_to_cpu, patch_kbit_preparation, patch_no_allocator_warmup
@@ -28,6 +29,7 @@ from .unpad import patch_qwen2_model
 
 
 def apply():
+    patch_packages_distributions()  # before the first `import transformers` below: one metadata scan
     patch_timeline()  # [time] lines in train.log: load / train / save split (prints only)
     start_background_compile()  # our kernels compile while Soup loads the model
     patch_bnb_matmul_4bit()  # NF4 weight dequantized once for recompute + backward
