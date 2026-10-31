@@ -23,6 +23,8 @@ streaming is switched off, so a surprise costs memory, not correctness.
 
 import torch
 
+from .mode import STREAMED_FORWARD
+
 ENABLED = True
 OFFLOAD_INPUTS = True  # the layer inputs kept for the backward also go to pinned CPU memory
 PREFETCH_DEPTH = 1
@@ -269,10 +271,15 @@ class _Streamed(torch.autograd.Function):
     def forward(ctx, hidden, holder, *params):
         manager, index = holder.manager, holder.index
         manager.fetch(index, +1)
-        # grad mode on, as in a recomputed layer: the patched LoRA / RoPE / norm paths are the
-        # ones that need it; the graph this builds is dropped with `out.detach()`
-        with torch.enable_grad():
-            out = holder.run(hidden)
+        # no autograd graph: the backward recomputes the layer from its input; our LoRA / RoPE /
+        # norm / SwiGLU functions keep their fast path here (mode.py), so this computes what the
+        # recompute does, with the same kernels and dropout seeds
+        STREAMED_FORWARD[0] = True
+        try:
+            with torch.no_grad():
+                out = holder.run(hidden)
+        finally:
+            STREAMED_FORWARD[0] = False
         manager.release(index, keep=index + 1 == len(manager.groups))
         ctx.holder, ctx.needs_grad = holder, hidden.requires_grad
         if OFFLOAD_INPUTS:

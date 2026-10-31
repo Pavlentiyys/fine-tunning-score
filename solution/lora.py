@@ -19,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .mode import fast_ok
+
 BLOCK = 1024
 
 
@@ -133,7 +135,7 @@ _STATIC = {}  # id(layer) -> (weight_a, weight_b, p, scaling) or None: the adapt
 
 def _fast_path(layer, x, args, kwargs):
     if (args or kwargs or layer.disable_adapters or layer.merged or not layer.training
-            or not torch.is_grad_enabled() or not x.is_cuda or x.dtype != torch.float16
+            or not fast_ok() or not x.is_cuda or x.dtype != torch.float16
             or not torch.is_autocast_enabled("cuda")
             or torch.get_autocast_dtype("cuda") != torch.float16):
         return None

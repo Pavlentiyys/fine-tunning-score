@@ -12,6 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .mode import fast_ok
+
 # q (12 heads) and k (2 heads) share one compiled kernel; the extra lanes are masked
 ROPE_HEADS = 16
 
@@ -169,7 +171,7 @@ def _fits(q, k, cos, sin, unsqueeze_dim):
             and cos.dim() == 3 and cos.shape == sin.shape and cos.shape[-1] == dim
             and cos.shape[1] == q.shape[2] and cos.shape[0] in (1, q.shape[0])
             and dim % 2 == 0 and (dim // 2) & (dim // 2 - 1) == 0
-            and not cos.requires_grad and not sin.requires_grad and torch.is_grad_enabled()
+            and not cos.requires_grad and not sin.requires_grad and fast_ok()
             and torch.is_autocast_enabled("cuda")
             and torch.get_autocast_dtype("cuda") == torch.float16)
 

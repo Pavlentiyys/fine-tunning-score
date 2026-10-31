@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .mode import fast_ok
+
 COLS = 1024
 
 
@@ -84,7 +86,7 @@ def patch_qwen2_mlp_own():
 
     def forward(self, x):
         act = getattr(getattr(self, "config", None), "hidden_act", "silu")
-        if act != "silu" or not x.is_cuda or not torch.is_grad_enabled():
+        if act != "silu" or not x.is_cuda or not fast_ok():
             return original(self, x)
         return self.down_proj(swiglu_inplace(self.gate_proj(x), self.up_proj(x)))
 

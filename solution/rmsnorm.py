@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .mode import fast_ok
+
 
 @triton.jit
 def soup_rmsnorm_fwd_kernel(x_ptr, w_ptr, y_ptr, xhat_ptr, rstd_ptr, n_cols, eps,
@@ -96,7 +98,7 @@ def patch_qwen2_rmsnorm():
 
     def forward(self, hidden_states):
         weight = self.weight
-        if (hidden_states.is_cuda and not weight.requires_grad and torch.is_grad_enabled()
+        if (hidden_states.is_cuda and not weight.requires_grad and fast_ok()
                 and _fp16_autocast()):
             return rmsnorm_half(hidden_states, weight, self.variance_epsilon)
         return original(self, hidden_states)
