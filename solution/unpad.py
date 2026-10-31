@@ -58,6 +58,13 @@ def _embedding_to_fp16(model):
     _mem("after embedding to fp16")
 
 
+def _embedding_to_gpu(model):
+    """The embedding kept on the CPU goes back to the GPU for any forward that is not ours."""
+    weight = model.embed_tokens.weight
+    if not weight.is_cuda and torch.cuda.is_available():
+        weight.data = weight.data.to("cuda")
+
+
 def _usable(model, input_ids, attention_mask, past_key_values, inputs_embeds, use_cache, kwargs):
     return (model.training and torch.is_grad_enabled() and input_ids is not None
             and inputs_embeds is None and past_key_values is None and not use_cache
@@ -117,6 +124,7 @@ def patch_qwen2_model():
                        kwargs):
             if _REGISTRY:
                 restore_all()
+            _embedding_to_gpu(self)
             return original(self, input_ids=input_ids, attention_mask=attention_mask,
                             position_ids=position_ids, past_key_values=past_key_values,
                             inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
@@ -125,11 +133,26 @@ def patch_qwen2_model():
         if _STEPS[0] in (1, 2, 3, 10):
             _mem(f"forward call {_STEPS[0]}")
         batch, seq = input_ids.shape
-        embeds = self.embed_tokens(input_ids)
-        if embeds.dtype == torch.float16:
-            embeds = embeds.float()  # the residual stream stays fp32, as in base Soup
+        flat_len = batch * seq
+        rows = attention_mask.reshape(-1).nonzero().squeeze(1)
+        weight = self.embed_tokens.weight
+        if weight.is_cuda:
+            embeds = self.embed_tokens(input_ids)
+            if embeds.dtype == torch.float16:
+                embeds = embeds.float()  # the residual stream stays fp32, as in base Soup
+            hidden = embeds.reshape(flat_len, -1).index_select(0, rows)
+        else:
+            # embedding in pinned CPU memory (prepare.py): look up the real tokens' rows there and
+            # copy only those; `embeds` is a zero-stride stand-in for the mask / RoPE helpers,
+            # which read only its shape, dtype and device
+            from .fused_ce import _pinned
+
+            ids = input_ids.reshape(-1).index_select(0, rows).cpu()
+            hidden = _pinned(weight).index_select(0, ids).to(input_ids.device).float()
+            embeds = torch.zeros((), dtype=torch.float32, device=input_ids.device).expand(
+                batch, seq, weight.shape[1])
         if position_ids is None:
-            position_ids = torch.arange(seq, device=embeds.device).unsqueeze(0)
+            position_ids = torch.arange(seq, device=input_ids.device).unsqueeze(0)
         mask_kwargs = {"config": self.config, "inputs_embeds": embeds,
                        "attention_mask": attention_mask, "past_key_values": None,
                        "position_ids": position_ids}
@@ -138,9 +161,6 @@ def patch_qwen2_model():
             masks["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
         position_embeddings = self.rotary_emb(embeds, position_ids)
 
-        flat_len = batch * seq
-        rows = attention_mask.reshape(-1).nonzero().squeeze(1)
-        hidden = embeds.reshape(flat_len, -1).index_select(0, rows)
         layers = self.layers[: self.config.num_hidden_layers]
         manager = get_manager(layers) if self.training else None
         for i, layer in enumerate(layers):

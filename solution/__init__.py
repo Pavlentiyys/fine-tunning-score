@@ -17,7 +17,7 @@ from .dequant import patch_bnb_matmul_4bit
 from .warmup import start_background_compile
 from .timeline import mark, patch_timeline
 from .stream import patch_bnb_offload
-from .prepare import patch_kbit_preparation
+from .prepare import patch_embedding_load_to_cpu, patch_kbit_preparation
 from .lora import patch_peft_lora_4bit
 from .fused_ce import patch_qwen2_causal_lm, patch_sft_trainer
 from .rmsnorm import patch_qwen2_rmsnorm
@@ -31,6 +31,7 @@ def apply():
     start_background_compile()  # our kernels compile while Soup loads the model
     patch_bnb_matmul_4bit()  # NF4 weight dequantized once for recompute + backward
     patch_bnb_offload()  # 4-bit weights go to pinned CPU memory as they are quantized
+    patch_embedding_load_to_cpu()  # the tied embedding / lm_head is loaded to (pinned) CPU memory
     patch_kbit_preparation()  # the tied embedding stays fp16: no fp32 copy, no allocator spike
     patch_qwen2_mlp_own()  # our SwiGLU, backward in place over the saved gate/up
     patch_qwen2_rmsnorm()  # fp32 residual in, fp16 out: the layer's activations become fp16

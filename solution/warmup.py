@@ -56,6 +56,11 @@ def _compile_all():
     lora.soup_lora_dropout_kernel.warmup(make(f16), make(f16), 1000, 1234, 0.05, 1.0 / 0.95,
                                          BLOCK=lora.BLOCK, grid=grid)
 
+    fused_ce.soup_ce_stream_kernel.warmup(
+        make(f16), fused_ce.HEAD_CHUNK, fused_ce.HEAD_CHUNK, 0, make(i32), make(f32), make(f32),
+        make(f32), make(f32), make(i32), make(f32), make(f32), 100, BLOCK_V=fused_ce.BLOCK_V,
+        num_warps=8, grid=grid)
+
     for write_grad in (False, True):
         fused_ce.soup_ce_rows_kernel.warmup(
             make(f16), VOCAB, make(i32), make(f32), make(f32), make(i32), VOCAB,

@@ -9,9 +9,49 @@ The head runs in fp16 under autocast anyway and the residual stream is made fp32
 
 The call is wrapped: the embedding's data is swapped for an empty tensor while peft casts, and put
 back (still fp16) afterwards. The weights, the trainable set and everything else are untouched.
+
+Further, with EMBEDDING_ON_CPU the tied embedding / lm_head never reaches the GPU: transformers
+materializes each checkpoint tensor with `tensor.to(device, dtype)` (for the bf16 -> fp16 embedding
+that briefly held both copies on the GPU, the process peak during loading), and this one tensor is
+materialized on the CPU instead. The training forward then looks up the real tokens' rows on the
+CPU (unpad.py) and streams the head in vocabulary chunks (fused_ce.py).
 """
 
 import torch
+
+EMBEDDING_ON_CPU = True
+VOCAB, HIDDEN = 151936, 1536  # Qwen2.5-1.5B's tied embedding: the one tensor of this shape
+
+
+def patch_embedding_load_to_cpu():
+    if not EMBEDDING_ON_CPU:
+        return
+    from transformers import core_model_loading
+    from transformers.modeling_utils import PreTrainedModel
+
+    original = core_model_loading._materialize_copy
+
+    def materialize(tensor, device=None, dtype=None):
+        if (device is not None and torch.device(device).type == "cuda"
+                and tuple(getattr(tensor, "shape", ())) == (VOCAB, HIDDEN)):
+            return original(tensor, "cpu", dtype or torch.float16)
+        return original(tensor, device, dtype)
+
+    core_model_loading._materialize_copy = materialize
+
+    # `model.device` is the first parameter's device, which is now the CPU embedding; anything
+    # that places inputs by it must still see the GPU the rest of the model is on
+    device_property = PreTrainedModel.device
+
+    def device(self):
+        found = device_property.fget(self)
+        if found.type == "cpu":
+            for param in self.parameters():
+                if param.is_cuda:
+                    return param.device
+        return found
+
+    PreTrainedModel.device = property(device)
 
 
 def patch_kbit_preparation():
@@ -27,7 +67,7 @@ def patch_kbit_preparation():
         except Exception:  # noqa: BLE001 - a model without one is simply not touched
             pass
         weight = getattr(embedding, "weight", None)
-        if weight is None or weight.dtype != torch.float16 or not weight.is_cuda:
+        if weight is None or weight.dtype != torch.float16:
             return original(model, *args, **kwargs)
         kept = weight.data
         weight.data = torch.empty(0, dtype=torch.float16, device=kept.device)

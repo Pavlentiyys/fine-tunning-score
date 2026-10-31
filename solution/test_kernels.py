@@ -58,9 +58,10 @@ def test_rmsnorm_half_matches_pytorch(in_dtype, shape):
     torch.testing.assert_close(x.grad.float(), ref_dx, rtol=5e-3, atol=5e-3)
 
 
+@pytest.mark.parametrize("on_cpu", [False, True])
 @pytest.mark.parametrize("vocab", [151936, 5003])
-def test_fused_head_loss_matches_pytorch(vocab):
-    from solution.fused_ce import fused_head_loss
+def test_fused_head_loss_matches_pytorch(vocab, on_cpu):
+    from solution.fused_ce import fused_head_loss, fused_head_loss_cpu_weight
 
     torch.manual_seed(0)
     batch, seq, width = 3, 70, 256
@@ -93,7 +94,11 @@ def test_fused_head_loss_matches_pytorch(vocab):
         mask = shift != -100
         ref_correct = ((logits.argmax(-1) == shift) & mask).sum()
 
-    loss, step = fused_head_loss(hidden, weight16, labels, attention_mask, num_items)
+    if on_cpu:
+        loss, step = fused_head_loss_cpu_weight(hidden, weight16.cpu().pin_memory(), labels,
+                                                attention_mask, num_items)
+    else:
+        loss, step = fused_head_loss(hidden, weight16, labels, attention_mask, num_items)
     loss.backward()
     torch.testing.assert_close(loss, ref_loss, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(hidden.grad, ref_grad, rtol=2e-2, atol=2e-5)

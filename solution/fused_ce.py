@@ -186,6 +186,193 @@ def fused_head_loss(hidden, weight16, labels, attention_mask, num_items_in_batch
     return total, step
 
 
+# ------------------------------------------- the same loss with the head weight on the CPU
+#
+# With the tied embedding / lm_head kept in pinned CPU memory (467 MB off the GPU), the head
+# weight is streamed in vocabulary chunks, each copied once per step while the previous chunk
+# computes. One pass is enough: per row the kernel keeps the online-softmax state (max, sum of
+# exp, sum of exp*x for the entropy, argmax, target logit) across chunks, and for labelled rows it
+# turns the chunk's logits into exp(x - running max), so that
+#     acc = sum over chunks of exp(x - m) @ W_chunk     (rescaled by exp(m_old - m_new))
+# gives softmax @ W = acc / sum_exp at the end; the hidden-state gradient is that minus W[target].
+
+HEAD_CHUNK = 8192  # vocabulary rows per streamed chunk: 25 MB of fp16 weights
+
+
+# col0 / n_cols / n_probs change per chunk and per batch: no divisibility specialization
+@triton.jit(do_not_specialize=["n_cols", "col0", "n_probs"])
+def soup_ce_stream_kernel(logits_ptr, stride_row, n_cols, col0, targets_ptr, max_ptr, sum_ptr,
+                          dot_ptr, best_val_ptr, best_idx_ptr, x_target_ptr, rescale_ptr,
+                          n_probs, BLOCK_V: tl.constexpr):
+    """One row of one vocabulary chunk: update the row's online-softmax state; rows below
+    `n_probs` also get their logits overwritten with exp(x - new max) (fp16, in [0, 1])."""
+    row = tl.program_id(0)
+    row_ptr = logits_ptr + row.to(tl.int64) * stride_row
+    target = tl.load(targets_ptr + row)
+    old_max = tl.load(max_ptr + row)
+    run_max = old_max
+    run_sum = tl.load(sum_ptr + row)
+    run_dot = tl.load(dot_ptr + row)
+    best_val = tl.load(best_val_ptr + row)
+    best_idx = tl.load(best_idx_ptr + row)
+    for start in range(0, n_cols, BLOCK_V):
+        cols = start + tl.arange(0, BLOCK_V)
+        valid = cols < n_cols
+        x = tl.load(row_ptr + cols, mask=valid, other=float("-inf")).to(tl.float32)
+        blk_max = tl.max(x, axis=0)
+        blk_arg = tl.argmax(x, axis=0)
+        best_idx = tl.where(blk_max > best_val, col0 + start + blk_arg, best_idx)
+        best_val = tl.maximum(best_val, blk_max)
+        new_max = tl.maximum(run_max, blk_max)
+        rescale = tl.exp(run_max - new_max)
+        e = tl.exp(x - new_max)
+        run_sum = run_sum * rescale + tl.sum(e, axis=0)
+        run_dot = run_dot * rescale + tl.sum(tl.where(valid, e * x, 0.0), axis=0)
+        run_max = new_max
+    tl.store(max_ptr + row, run_max)
+    tl.store(sum_ptr + row, run_sum)
+    tl.store(dot_ptr + row, run_dot)
+    tl.store(best_val_ptr + row, best_val)
+    tl.store(best_idx_ptr + row, best_idx)
+    tl.store(rescale_ptr + row, tl.exp(old_max - run_max))
+    local = target - col0
+    if (local >= 0) & (local < n_cols):
+        tl.store(x_target_ptr + row, tl.load(row_ptr + local).to(tl.float32))
+    if row < n_probs:
+        for start in range(0, n_cols, BLOCK_V):
+            cols = start + tl.arange(0, BLOCK_V)
+            valid = cols < n_cols
+            x = tl.load(row_ptr + cols, mask=valid, other=float("-inf")).to(tl.float32)
+            tl.store(row_ptr + cols, tl.exp(x - run_max).to(tl.float16), mask=valid)
+
+
+class _HeadChunks:
+    """Copies vocabulary chunks of a pinned CPU weight to the GPU one ahead of use."""
+
+    def __init__(self, weight_cpu):
+        self.weight, self.side = weight_cpu, _side_stream()
+        self.spans = [(c, min(c + HEAD_CHUNK, weight_cpu.shape[0]))
+                      for c in range(0, weight_cpu.shape[0], HEAD_CHUNK)]
+
+    def _copy(self, span):
+        with torch.cuda.stream(self.side):
+            chunk = torch.empty((span[1] - span[0], self.weight.shape[1]),
+                                dtype=self.weight.dtype, device="cuda")
+            chunk.copy_(self.weight[span[0]:span[1]], non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(self.side)
+        return chunk, done
+
+    def __iter__(self):
+        stream = torch.cuda.current_stream()
+        self.side.wait_stream(stream)
+        pending = self._copy(self.spans[0])
+        for i, span in enumerate(self.spans):
+            chunk, done = pending
+            if i + 1 < len(self.spans):
+                pending = self._copy(self.spans[i + 1])
+            stream.wait_event(done)
+            chunk.record_stream(stream)
+            yield span[0], chunk
+
+
+_SIDE = []
+
+
+def _side_stream():
+    if not _SIDE:
+        _SIDE.append(torch.cuda.Stream())
+    return _SIDE[0]
+
+
+class _StreamedHeadLoss(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden, weight_cpu, rows, targets, n_labelled, denominator, with_grad):
+        device = hidden.device
+        n_rows = rows.numel()
+        piece = hidden.index_select(0, rows).to(torch.float16)
+        run_max = torch.full((n_rows,), float("-inf"), dtype=torch.float32, device=device)
+        run_sum = torch.zeros(n_rows, dtype=torch.float32, device=device)
+        run_dot = torch.zeros_like(run_sum)
+        best_val = torch.full_like(run_max, float("-inf"))
+        best_idx = torch.zeros(n_rows, dtype=torch.int32, device=device)
+        x_target = torch.zeros_like(run_sum)
+        rescale = torch.empty_like(run_sum)
+        n_probs = n_labelled if with_grad else 0
+        acc = torch.zeros((n_probs, hidden.shape[1]), dtype=torch.float32, device=device)
+        for col0, chunk in _HeadChunks(weight_cpu):
+            logits = piece @ chunk.t()
+            soup_ce_stream_kernel[(n_rows,)](
+                logits, logits.stride(0), chunk.shape[0], col0, targets, run_max, run_sum,
+                run_dot, best_val, best_idx, x_target, rescale, n_probs, BLOCK_V=BLOCK_V,
+                num_warps=8)
+            if n_probs:
+                acc.mul_(rescale[:n_probs, None]).add_((logits[:n_probs] @ chunk).float())
+            del logits
+        lse = run_max + torch.log(run_sum)
+        entropy = lse - run_dot / run_sum
+        has_target = targets != IGNORE_INDEX
+        loss_rows = torch.where(has_target, lse - x_target, torch.zeros_like(lse))
+        total = loss_rows.sum() / denominator
+        grad_hidden = None
+        if with_grad:
+            grad_hidden = torch.zeros(hidden.shape, dtype=torch.float32, device=device)
+            if n_probs:
+                lab_targets = targets[:n_probs].long().cpu()
+                w_target = weight_cpu.index_select(0, lab_targets).to(device, non_blocking=True)
+                grad_rows = acc.div_(run_sum[:n_probs, None]).sub_(w_target.float())
+                grad_hidden.index_copy_(0, rows[:n_probs], grad_rows.div_(denominator))
+            ctx.save_for_backward(grad_hidden)
+        ctx.with_grad, ctx.hidden_dtype = with_grad, hidden.dtype
+        ctx.mark_non_differentiable(loss_rows, entropy, best_idx)
+        return total, loss_rows, entropy, best_idx
+
+    @staticmethod
+    def backward(ctx, grad_total, *_unused):
+        if not ctx.with_grad:
+            return (None,) * 7
+        (grad_hidden,) = ctx.saved_tensors
+        grad = (grad_hidden * grad_total.float()).to(ctx.hidden_dtype)
+        return grad, None, None, None, None, None, None
+
+
+def fused_head_loss_cpu_weight(hidden, weight_cpu, labels, attention_mask, num_items_in_batch=None):
+    """`fused_head_loss` with the head weight in pinned CPU memory, streamed in vocab chunks."""
+    batch, seq, width = hidden.shape
+    flat = hidden.reshape(batch * seq, width)
+    target = torch.nn.functional.pad(labels, (0, 1), value=IGNORE_INDEX)[:, 1:].reshape(-1)
+    target = target.to(hidden.device)
+    labelled_mask = target != IGNORE_INDEX
+    if attention_mask is not None:
+        attended = attention_mask.reshape(-1).to(hidden.device).bool()
+    else:
+        attended = torch.ones_like(labelled_mask)
+    lab_rows = labelled_mask.nonzero().squeeze(1)
+    other_rows = (attended & ~labelled_mask).nonzero().squeeze(1)
+    rows = torch.cat([lab_rows, other_rows])
+    n_labelled = lab_rows.numel()
+    targets = target.index_select(0, rows).to(torch.int32).contiguous()
+    labelled = torch.tensor(n_labelled, device=hidden.device)
+    if num_items_in_batch is None:
+        denominator = float(max(n_labelled, 1))
+    elif torch.is_tensor(num_items_in_batch):
+        denominator = float(num_items_in_batch.item())
+    else:
+        denominator = float(num_items_in_batch)
+    with_grad = torch.is_grad_enabled() and hidden.requires_grad
+    total, loss_rows, ent_rows, arg_rows = _StreamedHeadLoss.apply(
+        flat, weight_cpu, rows, targets, n_labelled, denominator, with_grad)
+    with torch.no_grad():
+        token_loss = torch.zeros(batch * seq, dtype=torch.float32, device=hidden.device)
+        token_loss[lab_rows] = loss_rows[:n_labelled]
+        token_entropy = torch.zeros(batch * seq, dtype=torch.float32, device=hidden.device)
+        token_entropy[rows] = ent_rows
+        correct = (arg_rows[:n_labelled].long() == target[lab_rows]).sum()
+    step = HeadStep(token_entropy=token_entropy.view(batch, seq),
+                    token_loss=token_loss.view(batch, seq), correct=correct, labelled=labelled)
+    return total, step
+
+
 # ---------------------------------------------------------------- wiring into transformers/TRL
 
 class _Last:
@@ -207,11 +394,19 @@ def _head_weight16(lm_head):
     return cached[1]
 
 
+def _pinned(weight):
+    """The CPU head / embedding weight in pinned memory (once), for async chunk copies."""
+    if not weight.data.is_pinned():
+        weight.data = weight.data.pin_memory()
+    return weight.detach()
+
+
 def _usable(model, labels):
     head = getattr(model, "lm_head", None)
     return (labels is not None and model.training and torch.is_grad_enabled()
             and isinstance(head, torch.nn.Linear) and head.bias is None
-            and not head.weight.requires_grad and head.weight.is_cuda
+            and not head.weight.requires_grad
+            and (head.weight.is_cuda or head.weight.dtype == torch.float16)
             and getattr(model.config, "final_logit_softcapping", None) is None)
 
 
@@ -231,8 +426,15 @@ def patch_qwen2_causal_lm():
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
                              position_ids=position_ids, past_key_values=past_key_values,
                              inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
-        loss, _Last.step = fused_head_loss(outputs.last_hidden_state, _head_weight16(self.lm_head),
-                                           labels, attention_mask,
+        weight = self.lm_head.weight
+        if not weight.is_cuda:  # kept in pinned CPU memory (see prepare.py): stream it
+            loss, _Last.step = fused_head_loss_cpu_weight(
+                outputs.last_hidden_state, _pinned(weight), labels, attention_mask,
+                kwargs.get("num_items_in_batch"))
+        else:
+            loss, _Last.step = fused_head_loss(outputs.last_hidden_state,
+                                               _head_weight16(self.lm_head), labels,
+                                               attention_mask,
                                            kwargs.get("num_items_in_batch"))
         return CausalLMOutputWithPast(loss=loss, logits=None,
                                       past_key_values=outputs.past_key_values,
