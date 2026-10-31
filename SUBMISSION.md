@@ -12,7 +12,7 @@ Soup Kernel Challenge, Decentrathon 6.0. Подробное описание р�
 - Публичный Kaggle-ноутбук, сохранённая версия (`COMMIT` в нём = sha выше; та же ссылка есть
   в README):
   https://www.kaggle.com/code/heyyazamat/larpers-soup-kernel-combo
-- Демо-видео (до 3 минут): TODO
+- Демо-видео (до 3 минут): https://drive.google.com/file/d/1PrrDtFJUlhBKCrv5V6nrTx_l4tRVp0E1/view?usp=sharing
 - Презентация (PDF): https://drive.google.com/drive/folders/1XKP456izSagmXDQB-UmTQA8-u5DS5u-u?usp=sharing
   (копия в репозитории: https://github.com/BAITC-Hacks/hack-1b4f2831-larpers/blob/main/assets/LARPERS_presentation.pdf)
 
