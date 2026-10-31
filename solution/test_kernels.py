@@ -103,3 +103,25 @@ def test_fused_head_loss_matches_pytorch(vocab):
     torch.testing.assert_close(step.token_loss, ref_token * mask, rtol=1e-4, atol=1e-4)
     assert int(step.correct) == int(ref_correct)
     assert int(step.labelled) == int(mask.sum())
+
+
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("shape", [(4, 512, 8960), (3, 77, 1001)])
+def test_inplace_swiglu_matches_pytorch(dtype, shape):
+    from solution.mlp import swiglu_inplace
+
+    torch.manual_seed(0)
+    gate = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
+    up = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
+    grad = torch.randn(shape, device="cuda", dtype=dtype)
+
+    ref = torch.nn.functional.silu(gate.float()) * up.float()
+    ref.backward(grad.float())
+    ref_dgate, ref_dup = gate.grad.float(), up.grad.float()
+    gate.grad = up.grad = None
+
+    out = swiglu_inplace(gate, up)
+    out.backward(grad)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(gate.grad.float(), ref_dgate, rtol=3e-3, atol=3e-3)
+    torch.testing.assert_close(up.grad.float(), ref_dup, rtol=3e-3, atol=3e-3)

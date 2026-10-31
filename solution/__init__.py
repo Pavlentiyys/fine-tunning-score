@@ -15,11 +15,11 @@ The rules in short (the README and the task statement have the full ones):
 
 from .fused_ce import patch_qwen2_causal_lm, patch_sft_trainer
 from .rmsnorm import patch_qwen2_rmsnorm
-from .swiglu import patch_qwen2_mlp
+from .mlp import patch_qwen2_mlp_own
 
 
 def apply():
-    patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
+    patch_qwen2_mlp_own()  # our SwiGLU: 2-D grid, backward in place over the saved gate/up
     patch_qwen2_rmsnorm()  # fp32 residual in, fp16 out: the layer's activations become fp16
     patch_qwen2_causal_lm()  # head + loss + entropy/argmax in chunks, no full logits
     patch_sft_trainer()  # TRL metrics and Soup's rewind losses from the fused step
