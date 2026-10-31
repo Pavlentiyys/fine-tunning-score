@@ -24,7 +24,9 @@ streaming is switched off, so a surprise costs memory, not correctness.
 import torch
 
 ENABLED = True
-_SLOT_ATTRS = ("absmax", "code", "offset")
+# the packed weights and the per-block scales; `offset` (one scalar) and `code` (256 values) stay on
+# the GPU: bitsandbytes reads them with .item() when it serializes the quantization state
+_SLOT_ATTRS = ("absmax",)
 
 
 class _Slot:
