@@ -143,13 +143,16 @@ def _rotate_qk(q, k, cos, sin, out_dtype, inverse):
 class _RopeQK(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, cos, sin):
-        ctx.save_for_backward(cos, sin)
+        # the cos/sin tables are shared by all layers and never modified: kept as attributes, not
+        # saved tensors, so q's and k's gradients may also come from two separate backward calls
+        # (one node serves both outputs; saved tensors would be freed by the first call)
+        ctx.cos, ctx.sin = cos, sin
         ctx.dtypes = q.dtype, k.dtype
         return _rotate_qk(q, k, cos, sin, torch.float16, inverse=False)
 
     @staticmethod
     def backward(ctx, grad_q, grad_k):
-        cos, sin = ctx.saved_tensors
+        cos, sin = ctx.cos, ctx.sin
         if ctx.dtypes[0] != ctx.dtypes[1]:  # one launch needs one output dtype
             return (_rotate(grad_q, cos, sin, ctx.dtypes[0], inverse=True),
                     _rotate(grad_k, cos, sin, ctx.dtypes[1], inverse=True), None, None)
