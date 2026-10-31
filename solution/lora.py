@@ -13,6 +13,8 @@ Same LoRA (same weights, scaling, dropout p and fp16 compute under autocast); th
 drawn from another generator than torch's, i.e. different random draws of the same distribution.
 """
 
+import weakref
+
 import torch
 import triton
 import triton.language as tl
@@ -40,12 +42,30 @@ def _dropout(x, seed, p):
     return out
 
 
+_HALF = {}  # id(weight) -> (version, data_ptr, fp16 copy): one cast per optimizer step, not six
+
+
+def _half(weight):
+    """`weight.to(float16)`, cached until the weight changes (the optimizer updates it in place,
+    which bumps its version counter): forward, recompute and backward of a step share one cast.
+    The entry also holds a weak reference, so a new tensor that reuses a freed one's id never
+    gets its copy."""
+    key = id(weight)
+    version, ptr = weight._version, weight.data_ptr()
+    cached = _HALF.get(key)
+    if cached is not None and cached[0]() is weight and cached[1] == version             and cached[2] == ptr:
+        return cached[3]
+    half = weight.detach().to(torch.float16)
+    _HALF[key] = (weakref.ref(weight), version, ptr, half)
+    return half
+
+
 class _LoraAdd(torch.autograd.Function):
     """base + scaling * dropout(x) @ A^T @ B^T, with x [M, K] fp16 and base [M, N] fp16."""
 
     @staticmethod
     def forward(ctx, x, base, weight_a, weight_b, p, scaling, seed):
-        a16, b16 = weight_a.to(torch.float16), weight_b.to(torch.float16)
+        a16, b16 = _half(weight_a), _half(weight_b)
         h = _dropout(x, seed, p) @ a16.t()
         out = torch.addmm(base, h, b16.t(), alpha=scaling)
         ctx.save_for_backward(x, h, weight_a, weight_b)
@@ -56,7 +76,7 @@ class _LoraAdd(torch.autograd.Function):
     def backward(ctx, grad):
         x, h, weight_a, weight_b = ctx.saved_tensors
         p, scaling, seed = ctx.p, ctx.scaling, ctx.seed
-        a16, b16 = weight_a.to(torch.float16), weight_b.to(torch.float16)
+        a16, b16 = _half(weight_a), _half(weight_b)
         grad = grad.contiguous()
         grad_b = (grad.t() @ h).float().mul_(scaling)
         dh = (grad @ b16).mul_(scaling)
@@ -108,12 +128,22 @@ def _take_seed():
     return _next_seed()
 
 
+_STATIC = {}  # id(layer) -> (weight_a, weight_b, p, scaling) or None: the adapter set is fixed
+
+
 def _fast_path(layer, x, args, kwargs):
     if (args or kwargs or layer.disable_adapters or layer.merged or not layer.training
             or not torch.is_grad_enabled() or not x.is_cuda or x.dtype != torch.float16
             or not torch.is_autocast_enabled("cuda")
             or torch.get_autocast_dtype("cuda") != torch.float16):
         return None
+    key = (id(layer), tuple(layer.active_adapters))
+    if key not in _STATIC:
+        _STATIC[key] = _static_path(layer)
+    return _STATIC[key]
+
+
+def _static_path(layer):
     adapters = [name for name in layer.active_adapters if name in layer.lora_A.keys()]
     if len(adapters) != 1 or adapters[0] in getattr(layer, "lora_variant", {}):
         return None
