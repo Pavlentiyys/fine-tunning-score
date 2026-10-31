@@ -25,7 +25,10 @@ import triton
 import triton.language as tl
 
 IGNORE_INDEX = -100
-CHUNK_ROWS = 1024  # 1024 x 151936 fp16 logits = 311 MB per chunk
+# 256 x 151936 fp16 logits = 78 MB per chunk. The head runs at the peak of the step (every
+# activation is still alive), so the chunk adds directly to the peak; 256 rows still keep the
+# matmuls large enough for the tensor cores.
+CHUNK_ROWS = 256
 BLOCK_V = 4096
 
 

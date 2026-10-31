@@ -18,6 +18,15 @@ output is upcast to fp32 so the residual stream stays fp32 as in base Soup.
 """
 
 import torch
+from torch.utils.checkpoint import checkpoint
+
+from .lora import draw_seeds, replay_seeds
+
+# Keep only each decoder layer's input for the backward and recompute the layer there (our own
+# recomputation: Soup's gradient_checkpointing switch stays off). Trades one more forward per layer
+# for the activations of all 28 layers.
+RECOMPUTE_LAYERS = True
+SEEDS_PER_LAYER = 4  # LoRA dropout seeds a layer may draw (q_proj and v_proj use two)
 
 _EMBED_DONE = set()
 
@@ -110,9 +119,18 @@ def patch_qwen2_model():
         rows = attention_mask.reshape(-1).nonzero().squeeze(1)
         hidden = embeds.reshape(flat_len, -1).index_select(0, rows)
         for i, layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-            hidden = _decoder_layer(layer, hidden, rows, flat_len, (batch, seq),
-                                    masks[self.config.layer_types[i]], position_embeddings,
-                                    kwargs)
+            args = (layer, rows, flat_len, (batch, seq), masks[self.config.layer_types[i]],
+                    position_embeddings, kwargs)
+            if RECOMPUTE_LAYERS:
+                seeds = draw_seeds(SEEDS_PER_LAYER)
+
+                def run(states, args=args, seeds=seeds):
+                    with replay_seeds(seeds):
+                        return _decoder_layer(args[0], states, *args[1:])
+
+                hidden = checkpoint(run, hidden, use_reentrant=False, preserve_rng_state=False)
+            else:
+                hidden = _decoder_layer(layer, hidden, *args[1:])
         hidden = self.norm(hidden)
         out = hidden.new_zeros(flat_len, hidden.shape[-1]).index_copy(0, rows, hidden)
         return BaseModelOutputWithPast(last_hidden_state=out.view(batch, seq, -1),

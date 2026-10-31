@@ -188,4 +188,6 @@ def test_lora_add_matches_pytorch():
     out.backward(grad)
     torch.testing.assert_close(out.float(), ref, rtol=2e-3, atol=2e-3)
     for got, want in zip((x.grad, base.grad, weight_a.grad, weight_b.grad), refs):
-        torch.testing.assert_close(got.float(), want, rtol=1e-2, atol=1e-2)
+        # fp16 matmuls summing over hundreds of tokens: compare against the tensor's own scale
+        scale = want.abs().max().item()
+        torch.testing.assert_close(got.float(), want, rtol=1e-2, atol=2e-3 * scale)

@@ -78,6 +78,36 @@ def _next_seed():
     return int(torch.randint(0, 2**31 - 1, (1,), generator=_GEN[0]).item())
 
 
+class _Replay:
+    seeds = None  # seeds handed out in order inside a recomputed region (see replay_seeds)
+
+
+def draw_seeds(count):
+    return [_next_seed() for _ in range(count)]
+
+
+class replay_seeds:
+    """Inside this block the LoRA layers take their dropout seeds from `seeds`, in call order. A
+    region that runs twice (forward, then recomputed in backward) gets the same list both times,
+    so the recomputed dropout masks are the ones the forward used."""
+
+    def __init__(self, seeds):
+        self.seeds, self.saved = list(seeds), None
+
+    def __enter__(self):
+        self.saved, _Replay.seeds = _Replay.seeds, list(self.seeds)
+
+    def __exit__(self, *exc):
+        _Replay.seeds = self.saved
+        return False
+
+
+def _take_seed():
+    if _Replay.seeds:
+        return _Replay.seeds.pop(0)
+    return _next_seed()
+
+
 def _fast_path(layer, x, args, kwargs):
     if (args or kwargs or layer.disable_adapters or layer.merged or not layer.training
             or not torch.is_grad_enabled() or not x.is_cuda or x.dtype != torch.float16
@@ -114,7 +144,7 @@ def patch_peft_lora_4bit():
         shape = base.shape
         out = _LoraAdd.apply(x.reshape(-1, x.shape[-1]).contiguous(),
                              base.reshape(-1, shape[-1]), weight_a, weight_b, p, scaling,
-                             _next_seed())
+                             _take_seed())
         return out.view(shape)
 
     cls.forward = forward
