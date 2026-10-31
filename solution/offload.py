@@ -172,13 +172,19 @@ class Offloader:
         self.held.add(index)
         self.prefetch(index)  # normally already started one layer earlier
         self.prefetch(index - 1)
-        self.layers.pop(index + 1, None)
+        # layer index+1's backward is over: whatever of it is still on the GPU (a saved tensor
+        # whose node did not run, or did not ask for it) is dropped now, not at the end of the step
+        for entry in self.layers.pop(index + 1, ()):
+            entry.back, entry.host, entry.gpu = None, None, None
 
     def step_end(self):
         """After the step's backward: release what is still held, clear the bookkeeping."""
         for index in sorted(self.held):
             self.manager.release(index)
         self.held.clear()
+        for saved in self.layers.values():
+            for entry in saved:
+                entry.back, entry.host, entry.gpu = None, None, None
         self.layers.clear()
         self.prune()
 
