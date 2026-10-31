@@ -25,7 +25,7 @@ import torch
 
 ENABLED = True
 OFFLOAD_INPUTS = True  # the layer inputs kept for the backward also go to pinned CPU memory
-PREFETCH_DEPTH = 2
+PREFETCH_DEPTH = 1
 ALIGN = 256  # byte alignment of each tensor inside a layer's packed buffer
 # the packed weights and the per-block scales; `offset` (one scalar) and `code` (256 values) stay on
 # the GPU: bitsandbytes reads them with .item() when it serializes the quantization state
@@ -130,45 +130,79 @@ class LayerManager:
                 self.arena[start + slot.offset:start + slot.offset + slot.nbytes].copy_(
                     slot.cpu.reshape(-1).view(torch.uint8))
                 slot.cpu = None
+        # a ring of persistent GPU buffers, allocated once on the main stream: the side stream only
+        # copies into them, so no blocks are owned by the side stream's pool and no frees are
+        # deferred by record_stream (both made the allocator reserve ~2x what was alive)
         self.side = torch.cuda.Stream()
-        self.staged = {}
+        width = max(stop - start for start, stop in self.spans)
+        self.ring = [torch.empty(width, dtype=torch.uint8, device="cuda")
+                     for _ in range(PREFETCH_DEPTH + 1)]
+        self.ring_free = [None] * len(self.ring)  # main-stream event: buffer no longer read
+        self.where, self.ready = {}, {}  # layer -> ring buffer, layer -> copy-done event
+        self.pending = []  # (layer input, event) whose copy to the host is still running
+
+    def _holder(self, buffer):
+        for layer, held in self.where.items():
+            if held == buffer:
+                return layer
+        return None
 
     def prefetch(self, index):
-        if not 0 <= index < len(self.groups) or index in self.staged or not self.groups[index]:
+        if not 0 <= index < len(self.groups) or index in self.where or not self.groups[index]:
+            return
+        buffer = index % len(self.ring)
+        if self._holder(buffer) is not None:
             return
         start, stop = self.spans[index]
         with torch.cuda.stream(self.side):
-            buffer = torch.empty(stop - start, dtype=torch.uint8, device="cuda")
-            buffer.copy_(self.arena[start:stop], non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(self.side)
-        self.staged[index] = (buffer, event)
+            if self.ring_free[buffer] is not None:
+                self.side.wait_event(self.ring_free[buffer])
+            self.ring[buffer][:stop - start].copy_(self.arena[start:stop], non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(self.side)
+        self.where[index], self.ready[index] = buffer, done
 
     def fetch(self, index, step):
-        if index not in self.staged:
+        self._prune()
+        if index not in self.where:
+            stale = self._holder(index % len(self.ring))
+            if stale is not None:  # a layer staged for an order that did not come
+                del self.where[stale], self.ready[stale]
             self.prefetch(index)
-        buffer, event = self.staged.pop(index)
-        stream = torch.cuda.current_stream()
-        stream.wait_event(event)
-        buffer.record_stream(stream)
+        torch.cuda.current_stream().wait_event(self.ready[index])
+        buffer = self.ring[self.where[index]]
         for slot in self.groups[index]:
             slot.set(slot.view_in(buffer))
         for ahead in range(1, PREFETCH_DEPTH + 1):
             self.prefetch(index + step * ahead)
 
-    def release(self, index):
+    def release(self, index, keep=False):
+        """Drop the layer's views; with `keep` its weights stay in their buffer (the backward
+        starts with the last layer of the forward)."""
         for slot in self.groups[index]:
             slot.drop()
+        if keep:
+            return
+        buffer = self.where.pop(index)
+        del self.ready[index]
+        done = torch.cuda.Event()
+        done.record(torch.cuda.current_stream())
+        self.ring_free[buffer] = done
+
+    def _prune(self):
+        self.pending = [(tensor, done) for tensor, done in self.pending if not done.query()]
 
     def to_host(self, tensor):
-        """Async copy of a layer input to pinned memory on the side stream."""
+        """Async copy of a layer input to pinned memory on the side stream; the GPU tensor is kept
+        referenced until the copy has finished, then freed the ordinary way."""
+        self._prune()
         host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
         done = torch.cuda.Event()
         self.side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.side):
             host.copy_(tensor, non_blocking=True)
             done.record(self.side)
-        tensor.record_stream(self.side)
+        self.pending.append((tensor, done))
         return host, done
 
     def from_host(self, host, done):
@@ -200,13 +234,11 @@ class _Streamed(torch.autograd.Function):
     def forward(ctx, hidden, holder, *params):
         manager, index = holder.manager, holder.index
         manager.fetch(index, +1)
-        if index + 1 == len(manager.groups):
-            manager.prefetch(index)  # the backward starts with this layer
         # grad mode on, as in a recomputed layer: the patched LoRA / RoPE / norm paths are the
         # ones that need it; the graph this builds is dropped with `out.detach()`
         with torch.enable_grad():
             out = holder.run(hidden)
-        manager.release(index)
+        manager.release(index, keep=index + 1 == len(manager.groups))
         ctx.holder, ctx.needs_grad = holder, hidden.requires_grad
         if OFFLOAD_INPUTS:
             ctx.host = manager.to_host(hidden.detach())

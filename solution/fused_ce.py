@@ -196,7 +196,7 @@ def fused_head_loss(hidden, weight16, labels, attention_mask, num_items_in_batch
 #     acc = sum over chunks of exp(x - m) @ W_chunk     (rescaled by exp(m_old - m_new))
 # gives softmax @ W = acc / sum_exp at the end; the hidden-state gradient is that minus W[target].
 
-HEAD_CHUNK = 8192  # vocabulary rows per streamed chunk: 25 MB of fp16 weights
+HEAD_CHUNK = 4096  # vocabulary rows per streamed chunk: 12.6 MB of fp16 weights
 
 
 # col0 / n_cols / n_probs change per chunk and per batch: no divisibility specialization
@@ -247,35 +247,47 @@ def soup_ce_stream_kernel(logits_ptr, stride_row, n_cols, col0, targets_ptr, max
 
 
 class _HeadChunks:
-    """Copies vocabulary chunks of a pinned CPU weight to the GPU one ahead of use."""
+    """Copies vocabulary chunks of a pinned CPU weight into two persistent GPU buffers, one chunk
+    ahead of use. The buffers are allocated once on the main stream; the side stream only copies
+    into a buffer after the main stream has recorded that it finished reading it."""
 
     def __init__(self, weight_cpu):
         self.weight, self.side = weight_cpu, _side_stream()
         self.spans = [(c, min(c + HEAD_CHUNK, weight_cpu.shape[0]))
                       for c in range(0, weight_cpu.shape[0], HEAD_CHUNK)]
+        shape = (HEAD_CHUNK, weight_cpu.shape[1])
+        if not _HEAD_RING or tuple(_HEAD_RING[0].shape) != shape:
+            _HEAD_RING[:] = [torch.empty(shape, dtype=weight_cpu.dtype, device="cuda")
+                             for _ in range(2)]
+            _HEAD_FREE[:] = [None, None]
 
-    def _copy(self, span):
+    def _copy(self, index):
+        buffer = index % 2
+        start, stop = self.spans[index]
         with torch.cuda.stream(self.side):
-            chunk = torch.empty((span[1] - span[0], self.weight.shape[1]),
-                                dtype=self.weight.dtype, device="cuda")
-            chunk.copy_(self.weight[span[0]:span[1]], non_blocking=True)
+            if _HEAD_FREE[buffer] is not None:
+                self.side.wait_event(_HEAD_FREE[buffer])
+            _HEAD_RING[buffer][:stop - start].copy_(self.weight[start:stop], non_blocking=True)
             done = torch.cuda.Event()
             done.record(self.side)
-        return chunk, done
+        return buffer, stop - start, done
 
     def __iter__(self):
         stream = torch.cuda.current_stream()
         self.side.wait_stream(stream)
-        pending = self._copy(self.spans[0])
-        for i, span in enumerate(self.spans):
-            chunk, done = pending
-            if i + 1 < len(self.spans):
-                pending = self._copy(self.spans[i + 1])
+        pending = self._copy(0)
+        for index, (start, _stop) in enumerate(self.spans):
+            buffer, rows, done = pending
+            if index + 1 < len(self.spans):
+                pending = self._copy(index + 1)
             stream.wait_event(done)
-            chunk.record_stream(stream)
-            yield span[0], chunk
+            yield start, _HEAD_RING[buffer][:rows]
+            read = torch.cuda.Event()
+            read.record(stream)
+            _HEAD_FREE[buffer] = read
 
 
+_HEAD_RING, _HEAD_FREE = [], []
 _SIDE = []
 
 

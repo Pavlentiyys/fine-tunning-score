@@ -25,7 +25,9 @@ VOCAB, HIDDEN = 151936, 1536  # Qwen2.5-1.5B's tied embedding: the one tensor of
 
 # what happened to the embedding while loading; printed with the first [mem] line of training
 LOAD_EVENTS = {"materialize calls": 0, "embedding materialized on cpu": 0,
-               "dispatch kept it on cpu": 0, "dispatch saw it on cuda": 0}
+               "dispatch kept it on cpu": 0, "dispatch saw it on cuda": 0,
+               "module.to kept it on cpu": 0}
+_KEEP_ON_CPU = []  # parameters that module.to() / .cuda() must leave where they are
 
 
 def load_summary():
@@ -98,6 +100,48 @@ def patch_embedding_load_to_cpu():
 
     hf_accelerate.accelerate_dispatch = accelerate_dispatch
     modeling_utils.accelerate_dispatch = accelerate_dispatch
+
+    # Later, `accelerate.prepare_model` (inside the Trainer) runs `model.to(device)` when the model
+    # carries no `hf_device_map`, which also carried the embedding to the GPU. Every `.to()` /
+    # `.cuda()` of a module goes through `nn.Module._apply`: the embedding registered right after
+    # loading is swapped for an empty CPU tensor for the duration of the call and put back.
+    import transformers
+
+    auto = transformers.AutoModelForCausalLM
+    load = auto.from_pretrained.__func__
+
+    def from_pretrained(cls, *args, **kwargs):
+        model = load(cls, *args, **kwargs)
+        try:
+            weight = model.get_input_embeddings().weight
+        except Exception:  # noqa: BLE001 - nothing to keep for a model without one
+            weight = None
+        if weight is not None and not weight.is_cuda and all(weight is not p for p in _KEEP_ON_CPU):
+            _KEEP_ON_CPU.append(weight)
+        return model
+
+    auto.from_pretrained = classmethod(from_pretrained)
+
+    module_apply = torch.nn.Module._apply
+    nesting = [0]
+
+    def _apply(self, fn, *args, **kwargs):
+        if not _KEEP_ON_CPU or nesting[0]:
+            return module_apply(self, fn, *args, **kwargs)
+        kept = [(param, param.data) for param in _KEEP_ON_CPU if not param.is_cuda]
+        for param, data in kept:
+            param.data = torch.empty(0, dtype=data.dtype)
+        nesting[0] += 1
+        try:
+            return module_apply(self, fn, *args, **kwargs)
+        finally:
+            nesting[0] -= 1
+            for param, data in kept:
+                if param.is_cuda:
+                    LOAD_EVENTS["module.to kept it on cpu"] += 1
+                param.data = data
+
+    torch.nn.Module._apply = _apply
 
     # `model.device` is the first parameter's device, which is now the CPU embedding; anything
     # that places inputs by it must still see the GPU the rest of the model is on
