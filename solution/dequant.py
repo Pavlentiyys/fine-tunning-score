@@ -46,7 +46,7 @@ class _Linear4bitNF4(torch.autograd.Function):
 
         if bias is not None and bias.dtype != a.dtype:
             bias = bias.to(a.dtype)  # what bitsandbytes' Linear4bit / autocast do with an fp32 bias
-        out = torch.nn.functional.linear(a, nf4_dequantize(packed, quant_state), bias)
+        out = torch.nn.functional.linear(a, nf4_dequantize(packed, quant_state, shared=True), bias)
         if ctx.needs_input_grad[0]:
             ctx.save_for_backward(packed)
             ctx.quant_state = quant_state
@@ -57,7 +57,7 @@ class _Linear4bitNF4(torch.autograd.Function):
         from .nf4 import nf4_dequantize
 
         (packed,) = ctx.saved_tensors
-        weight = nf4_dequantize(packed, ctx.quant_state)
+        weight = nf4_dequantize(packed, ctx.quant_state, shared=True)
         return grad.to(weight.dtype) @ weight, None, None, None
 
 
