@@ -65,9 +65,25 @@ def eligible(packed, quant_state):
             and packed.numel() * 2 == quant_state.shape[0] * quant_state.shape[1])
 
 
-def nf4_dequantize(packed, quant_state):
-    """fp16 weight [out, in] of a double-quantized NF4 Params4bit (see eligible())."""
-    out = torch.empty(tuple(quant_state.shape), dtype=torch.float16, device=packed.device)
+_SHARED = []  # one fp16 buffer, as large as the largest weight, reused by every layer
+
+
+def shared_weight(shape, device):
+    """A view of the shared dequantization buffer (idea: Unsloth's fast_dequantize reuses one
+    global weight buffer). Only for weights used right away on the current stream and never saved:
+    the next dequantization overwrites it, in stream order after the previous matmul read it."""
+    numel = shape[0] * shape[1]
+    if not _SHARED or _SHARED[0].numel() < numel or _SHARED[0].device != device:
+        _SHARED[:] = [torch.empty(max(numel, 8960 * 1536), dtype=torch.float16, device=device)]
+    return _SHARED[0][:numel].view(shape)
+
+
+def nf4_dequantize(packed, quant_state, shared=False):
+    """fp16 weight [out, in] of a double-quantized NF4 Params4bit (see eligible()); with `shared`,
+    written into the shared buffer (see shared_weight)."""
+    shape = tuple(quant_state.shape)
+    out = (shared_weight(shape, packed.device) if shared
+           else torch.empty(shape, dtype=torch.float16, device=packed.device))
     n_bytes = packed.numel()
     state2 = quant_state.state2
     offset = quant_state.offset  # an fp32 scalar on the GPU: the kernel loads it by pointer

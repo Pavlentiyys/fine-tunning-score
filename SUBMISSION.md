@@ -8,12 +8,12 @@ Soup Kernel Challenge, Decentrathon 6.0. Подробное описание р�
 [`README.md`](README.md).
 
 ## Ссылки
-- Репозиторий, финальный коммит: https://github.com/BAITC-Hacks/hack-1b4f2831-larpers/commit/6d0520e97be27aa89b07b3d6402e35de1e527c8a
+- Репозиторий, финальный коммит: https://github.com/BAITC-Hacks/hack-1b4f2831-larpers/commit/28c95e3b0e3482f2388c70e9b32d3916ddb59b14
 - Публичный Kaggle-ноутбук, сохранённая версия (`COMMIT` в нём = sha выше; та же ссылка есть
   в README):
   https://www.kaggle.com/code/heyyazamat/larpers-soup-kernel-submission
 - Демо-видео (до 3 минут): TODO
-- Презентация: TODO
+- Презентация: https://github.com/BAITC-Hacks/hack-1b4f2831-larpers/blob/main/assets/LARPERS_presentation.pdf
 
 ## Команда (до 4 человек)
 | Имя | Роль | GitHub | Kaggle | Контакт (капитан) |
@@ -23,7 +23,7 @@ Soup Kernel Challenge, Decentrathon 6.0. Подробное описание р�
 
 ## Что сделано (коротко)
 Фиксированный запуск `soup train` (Qwen2.5-1.5B-Instruct, NF4, LoRA r=16 на q/v, 64 шага, Kaggle T4)
-занимает ~0,7 ГБ видеопамяти вместо 14,3 ГБ и идёт в 1,58 раза быстрее базы при том же качестве
+занимает ~0,6 ГБ видеопамяти вместо 14,3 ГБ и идёт в 1,56 раза быстрее базы при том же качестве
 адаптера.
 - **9 собственных Triton-кернелов** считают распаковку NF4, RMSNorm, SwiGLU, RoPE, LoRA-dropout и
   слитую голову с кросс-энтропией.
@@ -39,15 +39,15 @@ Soup Kernel Challenge, Decentrathon 6.0. Подробное описание р�
 ## Наши кернелы
 | Кернел (имя `@triton.jit`) | Файл | Что заменяет | Доля времени обучения (проверка 4, по кернелам — прогон `fb741ed`) |
 |---|---|---|---|
-| `soup_nf4_dequant_kernel` | `solution/nf4.py` | распаковку NF4 в bitsandbytes с двойным квантованием масштабов (absmax dequant + прибавка offset + таблица NF4, три кернела) в forward и backward каждой 4-битной проекции | 8,6 % |
+| `soup_nf4_dequant_kernel` | `solution/nf4.py` | распаковку NF4 в bitsandbytes с двойным квантованием масштабов (absmax dequant + прибавка offset + таблица NF4, три кернела) в forward и backward каждой 4-битной проекции | 8,9 % |
 | `soup_lora_dropout_kernel` | `solution/lora.py` | `nn.Dropout` в LoRA из peft и его сохранённую bool-маску: маска восстанавливается из seed Philox в backward | 1,9 % |
 | `soup_mlp_fwd_kernel` | `solution/mlp.py` | `silu(gate) * up` (три операции PyTorch) | 1,1 % |
 | `soup_mlp_bwd_kernel` | `solution/mlp.py` | backward SwiGLU, пишется поверх сохранённых gate/up | 2,0 % |
-| `soup_rmsnorm_fwd_kernel` | `solution/rmsnorm.py` | forward Qwen2RMSNorm (вход fp32, выход fp16) | 0,8 % |
+| `soup_rmsnorm_fwd_kernel` | `solution/rmsnorm.py` | forward Qwen2RMSNorm (вход fp32, выход fp16) | 0,9 % |
 | `soup_rope_kernel`, `soup_rope_qk_kernel` | `solution/rope.py` | `apply_rotary_pos_emb` (шесть поэлементных операций), прямой и обратный поворот; q и k одним запуском | 1,3 % |
-| `soup_ce_stream_kernel` | `solution/fused_ce.py` | логиты lm_head + кросс-энтропия + энтропия/argmax, онлайн по кускам словаря, приходящим со стриминга | 1,1 % |
+| `soup_ce_stream_kernel` | `solution/fused_ce.py` | логиты lm_head + кросс-энтропия + энтропия/argmax, онлайн по кускам словаря, приходящим со стриминга | 1,0 % |
 | `soup_rmsnorm_bwd_kernel` | `solution/rmsnorm.py` | backward RMSNorm по сохранённой fp16-строке | 0,7 % |
-| **все вместе** | | | **17,0 %** в финальном прогоне `6d0520e` (требование: ≥ 5 %) |
+| **все вместе** | | | **17,3 %** в финальном прогоне `28c95e3` (требование: ≥ 5 %) |
 
 `soup_ce_rows_kernel` (`solution/fused_ce.py`) — слитая голова для эмбеддинга, лежащего на GPU. В
 замеряемой конфигурации он не запускается (эмбеддинг хранится в памяти CPU).
@@ -63,9 +63,9 @@ https://arxiv.org/abs/1805.02867), тип данных NF4 (QLoRA, https://arxiv
 
 | | Базовый Soup | Наше решение | Соотношение |
 |---|---|---|---|
-| Время `soup train`, с | 86,94 | 55,14 | speedup 1,58x |
-| Пик памяти GPU, MiB | 14 345 | 697 | base/ours 20,6x |
-| Eval loss (открытые строки) | 2,04962 | 2,04958 | −0,002 % к базе |
+| Время `soup train`, с | 86,53 | 55,31 | speedup 1,56x |
+| Пик памяти GPU, MiB | 14 345 | 639 | base/ours 22,4x |
+| Eval loss (открытые строки) | 2,04965 | 2,04961 | −0,002 % к базе |
 
 - [x] Все 10 проверок `harness/check_rules.py` пройдены
 - [x] README.md переписан под наше решение: что сделано, как запустить, результаты, ограничения
@@ -74,7 +74,7 @@ https://arxiv.org/abs/1805.02867), тип данных NF4 (QLoRA, https://arxiv
 | № | Требование | Статус |
 |---|---|---|
 | 1 | Запускается в чистом Kaggle-ноутбуке на T4 без правок | да, `templates/kaggle_notebook.ipynb`, «выполнить всё» |
-| 2 | Свои Triton-кернелы ≥ 5 % времени обучения с 3-го шага | да, 17,0 % |
+| 2 | Свои Triton-кернелы ≥ 5 % времени обучения с 3-го шага | да, 17,3 % |
 | 3 | Не хуже базы: loss ≤ +0,5 %, время и память ≤ +10 % | да: loss −0,002 %, время ×0,70, память ×0,038 базы |
 | 4 | Нет регрессий, 79 тестов Soup и `check_rules.py` проходят | да, 10 из 10 проверок |
 | 5 | README: что сделано, как запустить, результаты, ссылка на ноутбук | да |
