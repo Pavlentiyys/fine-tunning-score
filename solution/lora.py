@@ -70,15 +70,16 @@ class _LoraAdd(torch.autograd.Function):
         a16, b16 = _half(weight_a), _half(weight_b)
         h = _dropout(x, seed, p) @ a16.t()
         out = torch.addmm(base, h, b16.t(), alpha=scaling)
-        ctx.save_for_backward(x, h, weight_a, weight_b)
+        ctx.save_for_backward(x, h)
+        ctx.a16, ctx.b16 = a16, b16
         ctx.p, ctx.scaling, ctx.seed = p, scaling, seed
         return out
 
     @staticmethod
     def backward(ctx, grad):
-        x, h, weight_a, weight_b = ctx.saved_tensors
+        x, h = ctx.saved_tensors
         p, scaling, seed = ctx.p, ctx.scaling, ctx.seed
-        a16, b16 = _half(weight_a), _half(weight_b)
+        a16, b16 = ctx.a16, ctx.b16
         grad = grad.contiguous()
         grad_b = (grad.t() @ h).float().mul_(scaling)
         dh = (grad @ b16).mul_(scaling)

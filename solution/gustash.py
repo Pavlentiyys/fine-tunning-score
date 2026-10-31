@@ -66,32 +66,22 @@ def replay(mlp, x):
         return None
     gate, up = taken
     gate_l, up_l, down_l = linears
-    nxt = (GU["manager"], GU["index"] - 1) if PREFETCH_AFTER_MLP else None
     return _MlpReplay.apply(x, gate, up, _packed(gate_l), _packed(up_l), _packed(down_l),
                             gate_l.weight.quant_state, up_l.weight.quant_state,
-                            down_l.weight.quant_state, nxt)
-
-
-# The next layer's gate/up are copied back once this layer's are freed (end of the MLP backward),
-# not at the start of the layer's backward: both layers' [tokens, 8960] pairs were on the GPU at the
-# peak. The copy still overlaps the attention half of this layer's backward.
-PREFETCH_AFTER_MLP = True
+                            down_l.weight.quant_state)
 
 
 class _MlpReplay(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, gate, up, packed_gate, packed_up, packed_down, state_gate, state_up,
-                state_down, nxt=None):
-        ctx.save_for_backward(packed_gate, packed_up, packed_down)
-        ctx.gu = [gate, up]  # held here, not saved: the backward drops them as soon as it is done
-        ctx.states, ctx.nxt = (state_gate, state_up, state_down), nxt
+                state_down):
+        ctx.save_for_backward(gate, up, packed_gate, packed_up, packed_down)
+        ctx.states = (state_gate, state_up, state_down)
         return x.new_zeros(x.shape[0], state_down.shape[0])  # never read: only the graph is used
 
     @staticmethod
     def backward(ctx, d_out):
-        packed_gate, packed_up, packed_down = ctx.saved_tensors
-        gate, up = ctx.gu
-        ctx.gu = None
+        gate, up, packed_gate, packed_up, packed_down = ctx.saved_tensors
         state_gate, state_up, state_down = ctx.states
         weight = nf4_dequantize(packed_down, state_down)  # [hidden, inter]
         d_act = (d_out.to(weight.dtype) @ weight).contiguous()  # [tokens, inter]
@@ -104,9 +94,4 @@ class _MlpReplay(torch.autograd.Function):
         del weight
         weight = nf4_dequantize(packed_up, state_up)
         d_x = torch.addmm(d_x, up, weight)
-        del weight, gate, up  # freed in stream order: the queued GEMMs still read them first
-        if ctx.nxt is not None:
-            manager, index = ctx.nxt
-            ctx.nxt = None
-            manager.gu_prefetch(index)
-        return (d_x, None, None, None, None, None, None, None, None, None)
+        return (d_x, None, None, None, None, None, None, None, None)

@@ -255,8 +255,7 @@ def test_mlp_replay_matches_pytorch(tokens, monkeypatch):
     monkeypatch.setattr(gustash, "nf4_dequantize", lambda packed, state: state.dense)
     states = [SimpleNamespace(dense=w, shape=tuple(w.shape)) for w in (w_gate, w_up, w_down)]
     packed = [torch.empty(1, device="cuda") for _ in range(3)]
-    out = gustash._MlpReplay.apply(x, gate.detach().clone(), up.detach().clone(), *packed, *states,
-                                   None)
+    out = gustash._MlpReplay.apply(x, gate.detach().clone(), up.detach().clone(), *packed, *states)
     assert out.shape == (tokens, hidden) and out.dtype == torch.float16
     out.backward(grad)
     torch.testing.assert_close(x.grad.float(), ref_dx, rtol=2e-2, atol=2e-2)

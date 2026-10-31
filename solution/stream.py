@@ -31,7 +31,7 @@ PREFETCH_DEPTH = 1
 # The MLP's [gate, up] of every layer goes to pinned CPU memory in the forward and comes back in the
 # backward, so the recompute does not repeat the gate/up/down GEMMs (gustash.py). It is used only if
 # a short copy test at the first step shows a PCIe bus of at least GU_MIN_GBPS in both directions.
-GU_STASH = True
+GU_STASH = False  # the offloaded layers (offload.py) do not recompute: no gate/up stash, no bus test
 GU_MIN_GBPS = 8.0
 GU_INFLIGHT = 1  # layers whose gate/up copy to the host may still be running when the next starts
 ALIGN = 256  # byte alignment of each tensor inside a layer's packed buffer
@@ -532,10 +532,7 @@ class _Streamed(torch.autograd.Function):
         if OFFLOAD_INPUTS:
             manager.prefetch_input(index - 1)
         if manager.gu_on:
-            from .gustash import PREFETCH_AFTER_MLP
-
-            if not PREFETCH_AFTER_MLP:  # else the MLP backward starts it once its own are freed
-                manager.gu_prefetch(index - 1)
+            manager.gu_prefetch(index - 1)
         with torch.enable_grad():
             states = hidden.detach().requires_grad_(ctx.needs_grad)
             GU.update(manager=manager, index=index, mode="replay" if manager.gu_on else None)
