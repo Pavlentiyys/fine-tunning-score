@@ -32,9 +32,13 @@ def patch_embedding_load_to_cpu():
     original = core_model_loading._materialize_copy
 
     def materialize(tensor, device=None, dtype=None):
+        # `tensor` may be a lazy safetensors slice without `.shape`: read it first (on the CPU,
+        # which is where the slice is read anyway), then decide where it goes
+        tensor = tensor[...]
         if (device is not None and torch.device(device).type == "cuda"
-                and tuple(getattr(tensor, "shape", ())) == (VOCAB, HIDDEN)):
-            return original(tensor, "cpu", dtype or torch.float16)
+                and tuple(tensor.shape) == (VOCAB, HIDDEN)):
+            print("[load] tied embedding kept in CPU memory", flush=True)
+            return tensor.to(dtype=dtype or torch.float16)
         return original(tensor, device, dtype)
 
     core_model_loading._materialize_copy = materialize
