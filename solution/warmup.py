@@ -53,6 +53,18 @@ def _compile_all():
                 HALF=HEAD_DIM // 2, HEADS=rope.ROPE_HEADS, INVERSE=inverse, num_warps=4,
                 grid=grid)
 
+    # q and k in one launch (rope.rope_half): strides of [1, H, N, D] views, all %16
+    for inverse in (False, True):
+        rope.soup_rope_qk_kernel.warmup(
+            make(f16), make(f16), make(f16), make(f16), make(f32), make(f32),
+            512 * Q_HEADS * HEAD_DIM, HEAD_DIM, Q_HEADS * HEAD_DIM,
+            512 * KV_HEADS * HEAD_DIM, HEAD_DIM, KV_HEADS * HEAD_DIM,
+            512 * Q_HEADS * HEAD_DIM, HEAD_DIM, Q_HEADS * HEAD_DIM,
+            512 * KV_HEADS * HEAD_DIM, HEAD_DIM, KV_HEADS * HEAD_DIM,
+            0, HEAD_DIM, 512, Q_HEADS, KV_HEADS,
+            HALF=HEAD_DIM // 2, QH=rope.heads_lanes(Q_HEADS), KH=rope.heads_lanes(KV_HEADS),
+            INVERSE=inverse, num_warps=4, grid=grid)
+
     lora.soup_lora_dropout_kernel.warmup(make(f16), make(f16), 1000, 1234, 0.05, 1.0 / 0.95,
                                          BLOCK=lora.BLOCK, grid=grid)
 

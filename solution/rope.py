@@ -75,8 +75,91 @@ class _Rope(torch.autograd.Function):
         return _rotate(grad, cos, sin, ctx.x_dtype, inverse=True), None, None
 
 
+@triton.jit(do_not_specialize=["seq", "sqb", "skb", "soqb", "sokb", "scb"])
+def soup_rope_qk_kernel(q_ptr, k_ptr, oq_ptr, ok_ptr, cos_ptr, sin_ptr,
+                        sqb, sqh, sqt, skb, skh, skt, soqb, soqh, soqt, sokb, sokh, sokt,
+                        scb, sct, seq, n_q, n_k,
+                        HALF: tl.constexpr, QH: tl.constexpr, KH: tl.constexpr,
+                        INVERSE: tl.constexpr):
+    """soup_rope_kernel's rotation for q and k of the same positions in one launch: one program
+    per (batch, position) loads the cos/sin row once and rotates all q heads and all k heads."""
+    pid = tl.program_id(0)
+    b = (pid // seq).to(tl.int64)
+    t = (pid % seq).to(tl.int64)
+    d = tl.arange(0, HALF)[None, :]
+    tab = b * scb + t * sct + d
+    c1 = tl.load(cos_ptr + tab).to(tl.float32)
+    c2 = tl.load(cos_ptr + tab + HALF).to(tl.float32)
+    s1 = tl.load(sin_ptr + tab).to(tl.float32)
+    s2 = tl.load(sin_ptr + tab + HALF).to(tl.float32)
+    if INVERSE:
+        neg_s2 = -s2
+        s2 = -s1
+        s1 = neg_s2
+    hq = tl.arange(0, QH)[:, None]
+    live_q = hq < n_q
+    xq = q_ptr + b * sqb + t * sqt + hq * sqh + d
+    oq = oq_ptr + b * soqb + t * soqt + hq * soqh + d
+    q1 = tl.load(xq, mask=live_q, other=0.0).to(tl.float32)
+    q2 = tl.load(xq + HALF, mask=live_q, other=0.0).to(tl.float32)
+    tl.store(oq, (q1 * c1 - q2 * s1).to(oq_ptr.dtype.element_ty), mask=live_q)
+    tl.store(oq + HALF, (q2 * c2 + q1 * s2).to(oq_ptr.dtype.element_ty), mask=live_q)
+    hk = tl.arange(0, KH)[:, None]
+    live_k = hk < n_k
+    xk = k_ptr + b * skb + t * skt + hk * skh + d
+    ok = ok_ptr + b * sokb + t * sokt + hk * sokh + d
+    k1 = tl.load(xk, mask=live_k, other=0.0).to(tl.float32)
+    k2 = tl.load(xk + HALF, mask=live_k, other=0.0).to(tl.float32)
+    tl.store(ok, (k1 * c1 - k2 * s1).to(ok_ptr.dtype.element_ty), mask=live_k)
+    tl.store(ok + HALF, (k2 * c2 + k1 * s2).to(ok_ptr.dtype.element_ty), mask=live_k)
+
+
+def heads_lanes(heads):
+    return max(2, triton.next_power_of_2(heads))
+
+
+def _rotate_qk(q, k, cos, sin, out_dtype, inverse):
+    """q [B, Hq, T, D], k [B, Hk, T, D] (unit stride on D); outputs laid out as _rotate's."""
+    batch, q_heads, seq, dim = q.shape
+    k_heads = k.shape[1]
+    if q.stride(-1) != 1:
+        q = q.contiguous()
+    if k.stride(-1) != 1:
+        k = k.contiguous()
+    out_q = torch.empty((batch, seq, q_heads, dim), dtype=out_dtype, device=q.device).transpose(1, 2)
+    out_k = torch.empty((batch, seq, k_heads, dim), dtype=out_dtype, device=k.device).transpose(1, 2)
+    scb = cos.stride(0) if cos.shape[0] > 1 else 0
+    soup_rope_qk_kernel[(batch * seq,)](
+        q, k, out_q, out_k, cos, sin, q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2), out_q.stride(0), out_q.stride(1), out_q.stride(2),
+        out_k.stride(0), out_k.stride(1), out_k.stride(2), scb, cos.stride(1), seq, q_heads,
+        k_heads, HALF=dim // 2, QH=heads_lanes(q_heads), KH=heads_lanes(k_heads),
+        INVERSE=inverse, num_warps=4)
+    return out_q, out_k
+
+
+class _RopeQK(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, cos, sin):
+        ctx.save_for_backward(cos, sin)
+        ctx.dtypes = q.dtype, k.dtype
+        return _rotate_qk(q, k, cos, sin, torch.float16, inverse=False)
+
+    @staticmethod
+    def backward(ctx, grad_q, grad_k):
+        cos, sin = ctx.saved_tensors
+        if ctx.dtypes[0] != ctx.dtypes[1]:  # one launch needs one output dtype
+            return (_rotate(grad_q, cos, sin, ctx.dtypes[0], inverse=True),
+                    _rotate(grad_k, cos, sin, ctx.dtypes[1], inverse=True), None, None)
+        dq, dk = _rotate_qk(grad_q, grad_k, cos, sin, ctx.dtypes[0], inverse=True)
+        return dq, dk, None, None
+
+
 def rope_half(q, k, cos, sin):
     cos, sin = cos.contiguous(), sin.contiguous()
+    if (q.shape[0] == k.shape[0] and q.shape[2] == k.shape[2] and q.shape[3] == k.shape[3]
+            and q.device == k.device):
+        return _RopeQK.apply(q, k, cos, sin)
     return _Rope.apply(q, cos, sin), _Rope.apply(k, cos, sin)
 
 
