@@ -532,7 +532,10 @@ class _Streamed(torch.autograd.Function):
         if OFFLOAD_INPUTS:
             manager.prefetch_input(index - 1)
         if manager.gu_on:
-            manager.gu_prefetch(index - 1)
+            from .gustash import PREFETCH_AFTER_MLP
+
+            if not PREFETCH_AFTER_MLP:  # else the MLP backward starts it once its own are freed
+                manager.gu_prefetch(index - 1)
         with torch.enable_grad():
             states = hidden.detach().requires_grad_(ctx.needs_grad)
             GU.update(manager=manager, index=index, mode="replay" if manager.gu_on else None)
