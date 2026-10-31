@@ -139,6 +139,7 @@ class LayerManager:
                      for _ in range(PREFETCH_DEPTH + 1)]
         self.ring_free = [None] * len(self.ring)  # main-stream event: buffer no longer read
         self.where, self.ready = {}, {}  # layer -> ring buffer, layer -> copy-done event
+        self.views = {}  # (layer, ring buffer) -> views of the layer's tensors in that buffer
         self.pending = []  # (layer input, event) whose copy to the host is still running
         self.inputs = {}  # layer -> {"host": (pinned copy, event), "gpu": (tensor, event) or None}
 
@@ -171,9 +172,13 @@ class LayerManager:
                 del self.where[stale], self.ready[stale]
             self.prefetch(index)
         torch.cuda.current_stream().wait_event(self.ready[index])
-        buffer = self.ring[self.where[index]]
-        for slot in self.groups[index]:
-            slot.set(slot.view_in(buffer))
+        where = self.where[index]
+        views = self.views.get((index, where))
+        if views is None:  # the ring buffers are persistent: a layer's views never change
+            buffer = self.ring[where]
+            views = self.views[(index, where)] = [slot.view_in(buffer) for slot in self.groups[index]]
+        for slot, view in zip(self.groups[index], views):
+            slot.set(view)
         for ahead in range(1, PREFETCH_DEPTH + 1):
             self.prefetch(index + step * ahead)
 
@@ -310,8 +315,13 @@ class LayerCall:
         self.manager, self.index, self.run, self.params = manager, index, run, params
 
 
+_TRAINABLE = {}  # id(layer) -> its trainable parameters (fixed for the run: LoRA A/B)
+
+
 def streamed_layer(manager, index, run, layer, hidden):
-    params = [p for p in layer.parameters() if p.requires_grad]
+    params = _TRAINABLE.get(id(layer))
+    if params is None:
+        params = _TRAINABLE[id(layer)] = [p for p in layer.parameters() if p.requires_grad]
     holder = LayerCall(manager, index, run, params)
     return _Streamed.apply(hidden, holder, *params)
 

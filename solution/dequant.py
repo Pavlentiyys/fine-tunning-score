@@ -93,3 +93,27 @@ def patch_bnb_matmul_4bit():
         return original(A, B, quant_state=quant_state, out=out, bias=bias)
 
     bnb.matmul_4bit = matmul_4bit
+
+    linear4bit = bnb.nn.Linear4bit
+    original_forward = linear4bit.forward
+
+    def forward(self, x):
+        weight = self.weight
+        quant_state = getattr(weight, "quant_state", None)
+        bias = self.bias
+        if (streaming() and quant_state is not None and torch.is_tensor(x) and x.is_cuda
+                and x.dtype == torch.float16 and x.dim() >= 2 and x.numel() > x.shape[-1]
+                and self.compute_dtype in (None, torch.float16)
+                and not (bias is not None and bias.requires_grad)):
+            from .nf4 import eligible
+
+            packed = weight.data.reshape(-1, 1)
+            if eligible(packed, quant_state):
+                if bias is not None and bias.dtype != x.dtype:
+                    bias.data = bias.data.to(x.dtype)  # what bitsandbytes' forward does, once
+                lead = x.shape[:-1]
+                out = _Linear4bitNF4.apply(x.reshape(-1, x.shape[-1]), packed, bias, quant_state)
+                return out.view(*lead, out.shape[-1])
+        return original_forward(self, x)
+
+    linear4bit.forward = forward
