@@ -21,6 +21,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from .lora import draw_seeds, replay_seeds
+from .stream import _REGISTRY, get_manager, restore_all, streamed_layer
 
 # Keep only each decoder layer's input for the backward and recompute the layer there (our own
 # recomputation: Soup's gradient_checkpointing switch stays off). Trades one more forward per layer
@@ -110,8 +111,12 @@ def patch_qwen2_model():
 
     def forward(self, input_ids=None, attention_mask=None, position_ids=None,
                 past_key_values=None, inputs_embeds=None, use_cache=None, **kwargs):
+        if _REGISTRY and not self.training:
+            restore_all()  # anything that is not a training forward needs the weights on the GPU
         if not _usable(self, input_ids, attention_mask, past_key_values, inputs_embeds, use_cache,
                        kwargs):
+            if _REGISTRY:
+                restore_all()
             return original(self, input_ids=input_ids, attention_mask=attention_mask,
                             position_ids=position_ids, past_key_values=past_key_values,
                             inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
@@ -136,17 +141,23 @@ def patch_qwen2_model():
         flat_len = batch * seq
         rows = attention_mask.reshape(-1).nonzero().squeeze(1)
         hidden = embeds.reshape(flat_len, -1).index_select(0, rows)
-        for i, layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+        layers = self.layers[: self.config.num_hidden_layers]
+        manager = get_manager(layers) if self.training else None
+        for i, layer in enumerate(layers):
             args = (layer, rows, flat_len, (batch, seq), masks[self.config.layer_types[i]],
                     position_embeddings, kwargs)
-            if RECOMPUTE_LAYERS:
+            if manager is not None or RECOMPUTE_LAYERS:
                 seeds = draw_seeds(SEEDS_PER_LAYER)
 
                 def run(states, args=args, seeds=seeds):
                     with replay_seeds(seeds):
                         return _decoder_layer(args[0], states, *args[1:])
 
-                hidden = checkpoint(run, hidden, use_reentrant=False, preserve_rng_state=False)
+                if manager is not None:
+                    hidden = streamed_layer(manager, i, run, layer, hidden)
+                else:
+                    hidden = checkpoint(run, hidden, use_reentrant=False,
+                                        preserve_rng_state=False)
             else:
                 hidden = _decoder_layer(layer, hidden, *args[1:])
         hidden = self.norm(hidden)

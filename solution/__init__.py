@@ -13,6 +13,8 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+from .stream import patch_bnb_offload
+from .prepare import patch_kbit_preparation
 from .lora import patch_peft_lora_4bit
 from .fused_ce import patch_qwen2_causal_lm, patch_sft_trainer
 from .rmsnorm import patch_qwen2_rmsnorm
@@ -22,6 +24,8 @@ from .unpad import patch_qwen2_model
 
 
 def apply():
+    patch_bnb_offload()  # 4-bit weights go to pinned CPU memory as they are quantized
+    patch_kbit_preparation()  # the tied embedding stays fp16: no fp32 copy, no allocator spike
     patch_qwen2_mlp_own()  # our SwiGLU, backward in place over the saved gate/up
     patch_qwen2_rmsnorm()  # fp32 residual in, fp16 out: the layer's activations become fp16
     patch_qwen2_rope()  # q/k rotation in one kernel, fp16 out, nothing saved
