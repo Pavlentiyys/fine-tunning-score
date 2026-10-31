@@ -40,8 +40,11 @@ def patch_bnb_matmul_4bit():
 
     original = bnb.matmul_4bit
 
+    from .stream import streaming
+
     def matmul_4bit(A, B, quant_state, out=None, bias=None):
-        if (out is None and quant_state is not None and torch.is_grad_enabled()
+        # with streamed weights the ~94 MB of a layer's fp16 weights would sit on top of the peak
+        if (not streaming() and out is None and quant_state is not None and torch.is_grad_enabled()
                 and A.requires_grad and A.is_cuda and A.dtype == torch.float16
                 and A.dim() >= 2 and A.numel() // A.shape[-1] > MIN_ROWS
                 and len(quant_state.shape) == 2

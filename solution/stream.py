@@ -23,20 +23,28 @@ streaming is switched off, so a surprise costs memory, not correctness.
 
 import torch
 
-ENABLED = False
+ENABLED = True
+OFFLOAD_INPUTS = True  # the layer inputs kept for the backward also go to pinned CPU memory
+PREFETCH_DEPTH = 2
+ALIGN = 256  # byte alignment of each tensor inside a layer's packed buffer
 # the packed weights and the per-block scales; `offset` (one scalar) and `code` (256 values) stay on
 # the GPU: bitsandbytes reads them with .item() when it serializes the quantization state
 _SLOT_ATTRS = ("absmax",)
 
 
 class _Slot:
-    """One tensor attribute (`owner.attr`) whose data is kept on the CPU."""
+    """One tensor attribute (`owner.attr`) whose data is kept on the CPU. Until the first forward
+    the copy is in ordinary (pageable) memory: pinning ~600 small tensors one by one while the model
+    loads was slow. The first forward packs each layer's slots into one pinned arena."""
 
-    __slots__ = ("owner", "attr", "cpu", "device", "placeholder")
+    __slots__ = ("owner", "attr", "cpu", "device", "placeholder", "dtype", "shape", "nbytes",
+                 "offset")
 
     def __init__(self, owner, attr, tensor):
         self.owner, self.attr, self.device = owner, attr, tensor.device
-        self.cpu = tensor.detach().to("cpu").pin_memory()
+        self.dtype, self.shape = tensor.dtype, tuple(tensor.shape)
+        self.nbytes, self.offset = tensor.numel() * tensor.element_size(), None
+        self.cpu = tensor.detach().to("cpu")
         self.placeholder = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
         self.drop()
 
@@ -52,13 +60,18 @@ class _Slot:
         else:
             setattr(self.owner, self.attr, tensor)
 
+    def view_in(self, buffer):
+        """This slot's tensor as a view into a layer's packed uint8 buffer."""
+        raw = buffer[self.offset:self.offset + self.nbytes]
+        return raw.view(self.dtype).view(self.shape)
+
 
 _REGISTRY = {}  # id(Params4bit) -> (param, [slots])
 _STATE = {"manager": None, "disabled": False}
 
 
 def offload_param(param):
-    """Move a freshly quantized Params4bit's tensors to pinned CPU memory."""
+    """Move a freshly quantized Params4bit's tensors to CPU memory."""
     if id(param) in _REGISTRY or param.quant_state is None or not param.data.is_cuda:
         return
     slots = [_Slot(param, "data", param.data)]
@@ -76,17 +89,27 @@ def offload_param(param):
 def restore_all():
     """Copy every offloaded tensor back to the GPU and stop streaming (the safe way out)."""
     _STATE["disabled"] = True
-    for _param, slots in _REGISTRY.values():
-        for slot in slots:
-            slot.set(slot.cpu.to(slot.device))
+    manager = _STATE["manager"]
+    if manager is not None:  # packed: each layer's slots are views into its span of the arena
+        for slots, (start, stop) in zip(manager.groups, manager.spans):
+            span = manager.arena[start:stop].to("cuda")
+            for slot in slots:
+                slot.set(slot.view_in(span).clone())
+    else:
+        for _param, slots in _REGISTRY.values():
+            for slot in slots:
+                slot.set(slot.cpu.to(slot.device))
     _REGISTRY.clear()
+    _STATE["manager"] = None
 
 
 class LayerManager:
-    """Fetches and drops the offloaded weights of one decoder layer at a time."""
+    """Fetches and drops the offloaded weights of one decoder layer at a time: one pinned arena
+    for all layers, one host-to-device copy per layer, views into it for each tensor."""
 
     def __init__(self, layers):
-        self.groups = []
+        self.groups, self.spans = [], []
+        total = 0
         for layer in layers:
             slots = []
             for param in layer.parameters():
@@ -95,32 +118,63 @@ class LayerManager:
                     if entry is None:
                         raise LookupError("a 4-bit weight was not offloaded")
                     slots += entry[1]
+            start = total
+            for slot in slots:
+                slot.offset = total - start
+                total += -(-slot.nbytes // ALIGN) * ALIGN
             self.groups.append(slots)
+            self.spans.append((start, total))
+        self.arena = torch.empty(total, dtype=torch.uint8, pin_memory=True)
+        for slots, (start, _stop) in zip(self.groups, self.spans):
+            for slot in slots:
+                self.arena[start + slot.offset:start + slot.offset + slot.nbytes].copy_(
+                    slot.cpu.reshape(-1).view(torch.uint8))
+                slot.cpu = None
         self.side = torch.cuda.Stream()
         self.staged = {}
 
     def prefetch(self, index):
         if not 0 <= index < len(self.groups) or index in self.staged or not self.groups[index]:
             return
+        start, stop = self.spans[index]
         with torch.cuda.stream(self.side):
-            tensors = [slot.cpu.to(slot.device, non_blocking=True) for slot in self.groups[index]]
+            buffer = torch.empty(stop - start, dtype=torch.uint8, device="cuda")
+            buffer.copy_(self.arena[start:stop], non_blocking=True)
             event = torch.cuda.Event()
             event.record(self.side)
-        self.staged[index] = (tensors, event)
+        self.staged[index] = (buffer, event)
 
-    def fetch(self, index):
+    def fetch(self, index, step):
         if index not in self.staged:
             self.prefetch(index)
-        tensors, event = self.staged.pop(index)
+        buffer, event = self.staged.pop(index)
         stream = torch.cuda.current_stream()
         stream.wait_event(event)
-        for slot, tensor in zip(self.groups[index], tensors):
-            tensor.record_stream(stream)
-            slot.set(tensor)
+        buffer.record_stream(stream)
+        for slot in self.groups[index]:
+            slot.set(slot.view_in(buffer))
+        for ahead in range(1, PREFETCH_DEPTH + 1):
+            self.prefetch(index + step * ahead)
 
     def release(self, index):
         for slot in self.groups[index]:
             slot.drop()
+
+    def to_host(self, tensor):
+        """Async copy of a layer input to pinned memory on the side stream."""
+        host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+        done = torch.cuda.Event()
+        self.side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.side):
+            host.copy_(tensor, non_blocking=True)
+            done.record(self.side)
+        tensor.record_stream(self.side)
+        return host, done
+
+    def from_host(self, host, done):
+        stream = torch.cuda.current_stream()
+        stream.wait_event(done)
+        return host.to("cuda", non_blocking=True)
 
 
 def get_manager(layers):
@@ -136,32 +190,44 @@ def get_manager(layers):
     return _STATE["manager"]
 
 
+def streaming():
+    return _STATE["manager"] is not None
+
+
 class _Streamed(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
     def forward(ctx, hidden, holder, *params):
         manager, index = holder.manager, holder.index
-        manager.fetch(index)
-        manager.prefetch(index + 1 if index + 1 < len(manager.groups) else index)
+        manager.fetch(index, +1)
+        if index + 1 == len(manager.groups):
+            manager.prefetch(index)  # the backward starts with this layer
         # grad mode on, as in a recomputed layer: the patched LoRA / RoPE / norm paths are the
         # ones that need it; the graph this builds is dropped with `out.detach()`
         with torch.enable_grad():
             out = holder.run(hidden)
         manager.release(index)
-        ctx.holder = holder
-        ctx.save_for_backward(hidden)
+        ctx.holder, ctx.needs_grad = holder, hidden.requires_grad
+        if OFFLOAD_INPUTS:
+            ctx.host = manager.to_host(hidden.detach())
+        else:
+            ctx.host = None
+            ctx.save_for_backward(hidden)
         return out.detach()
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_out):
-        (hidden,) = ctx.saved_tensors
         holder = ctx.holder
         manager, index = holder.manager, holder.index
-        manager.fetch(index)
-        manager.prefetch(index - 1)
+        if ctx.host is not None:
+            hidden = manager.from_host(*ctx.host)
+            ctx.host = None
+        else:
+            (hidden,) = ctx.saved_tensors
+        manager.fetch(index, -1)
         with torch.enable_grad():
-            states = hidden.detach().requires_grad_(hidden.requires_grad)
+            states = hidden.detach().requires_grad_(ctx.needs_grad)
             out = holder.run(states)
             params = holder.params
             inputs = ([states] if states.requires_grad else []) + params

@@ -15,6 +15,7 @@ The rules in short (the README and the task statement have the full ones):
 
 from .dequant import patch_bnb_matmul_4bit
 from .warmup import start_background_compile
+from .timeline import mark, patch_timeline
 from .stream import patch_bnb_offload
 from .prepare import patch_kbit_preparation
 from .lora import patch_peft_lora_4bit
@@ -26,6 +27,7 @@ from .unpad import patch_qwen2_model
 
 
 def apply():
+    patch_timeline()  # [time] lines in train.log: load / train / save split (prints only)
     start_background_compile()  # our kernels compile while Soup loads the model
     patch_bnb_matmul_4bit()  # NF4 weight dequantized once for recompute + backward
     patch_bnb_offload()  # 4-bit weights go to pinned CPU memory as they are quantized
@@ -37,3 +39,4 @@ def apply():
     patch_peft_lora_4bit()  # LoRA: dropout mask regenerated from a seed, no clone, one addmm
     patch_qwen2_causal_lm()  # head + loss + entropy/argmax in chunks, no full logits
     patch_sft_trainer()  # TRL metrics and Soup's rewind losses from the fused step
+    mark("apply done")
