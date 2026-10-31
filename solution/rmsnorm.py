@@ -7,9 +7,10 @@ input's dtype, and every activation of the layer is stored in fp32. Under fp16 a
 matmul rounds the norm's output to fp16 anyway, so returning fp16 here changes no matmul input and
 halves the activations that follow (q, k, v, gate, up, the SwiGLU product).
 
-One program per row: the sum of squares, the rsqrt and the weight in fp32, one fp16 store. The
-backward (the norm weight is frozen under LoRA, so only the input gradient) recomputes the
-normalized row from the saved input and the per-row rstd instead of keeping fp32 copies.
+One program per row: the sum of squares, the rsqrt and the weight in fp32, fp16 stores. For the
+backward (the norm weight is frozen under LoRA, so only the input gradient) the forward also stores
+the normalized row xhat = x * rstd in fp16 (bounded by sqrt(hidden), so fp16 keeps it to 1e-3
+relative) plus one fp32 rstd per row; the fp32 residual itself is not kept alive by the norm.
 """
 
 import torch
@@ -18,28 +19,30 @@ import triton.language as tl
 
 
 @triton.jit
-def soup_rmsnorm_fwd_kernel(x_ptr, w_ptr, y_ptr, rstd_ptr, n_cols, eps, BLOCK: tl.constexpr):
+def soup_rmsnorm_fwd_kernel(x_ptr, w_ptr, y_ptr, xhat_ptr, rstd_ptr, n_cols, eps,
+                            BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     inside = cols < n_cols
     x = tl.load(x_ptr + row * n_cols + cols, mask=inside, other=0.0).to(tl.float32)
     rstd = tl.rsqrt(tl.sum(x * x, axis=0) / n_cols + eps)
     w = tl.load(w_ptr + cols, mask=inside, other=0.0).to(tl.float32)
-    tl.store(y_ptr + row * n_cols + cols, (x * rstd * w).to(y_ptr.dtype.element_ty), mask=inside)
+    xhat = x * rstd
+    tl.store(y_ptr + row * n_cols + cols, (xhat * w).to(y_ptr.dtype.element_ty), mask=inside)
+    tl.store(xhat_ptr + row * n_cols + cols, xhat.to(tl.float16), mask=inside)
     tl.store(rstd_ptr + row, rstd)
 
 
 @triton.jit
-def soup_rmsnorm_bwd_kernel(dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr, n_cols, BLOCK: tl.constexpr):
-    """dx = rstd * (w*dy - xhat * mean(w*dy * xhat)), xhat = x * rstd."""
+def soup_rmsnorm_bwd_kernel(dy_ptr, xhat_ptr, w_ptr, rstd_ptr, dx_ptr, n_cols, BLOCK: tl.constexpr):
+    """dx = rstd * (w*dy - xhat * mean(w*dy * xhat)), from the saved fp16 xhat = x * rstd."""
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     inside = cols < n_cols
     dy = tl.load(dy_ptr + row * n_cols + cols, mask=inside, other=0.0).to(tl.float32)
-    x = tl.load(x_ptr + row * n_cols + cols, mask=inside, other=0.0).to(tl.float32)
+    xhat = tl.load(xhat_ptr + row * n_cols + cols, mask=inside, other=0.0).to(tl.float32)
     w = tl.load(w_ptr + cols, mask=inside, other=0.0).to(tl.float32)
     rstd = tl.load(rstd_ptr + row)
-    xhat = x * rstd
     wdy = w * dy
     proj = tl.sum(wdy * xhat, axis=0) / n_cols
     dx = (wdy - xhat * proj) * rstd
@@ -53,24 +56,26 @@ class _RMSNormHalfOut(torch.autograd.Function):
         x2 = x.reshape(-1, shape[-1]).contiguous()
         rows, cols = x2.shape
         y = torch.empty((rows, cols), dtype=out_dtype, device=x.device)
+        xhat = torch.empty((rows, cols), dtype=torch.float16, device=x.device)
         rstd = torch.empty(rows, dtype=torch.float32, device=x.device)
         block = triton.next_power_of_2(cols)
         warps = 8 if block >= 2048 else 4
         if rows:
-            soup_rmsnorm_fwd_kernel[(rows,)](x2, weight, y, rstd, cols, eps, BLOCK=block,
+            soup_rmsnorm_fwd_kernel[(rows,)](x2, weight, y, xhat, rstd, cols, eps, BLOCK=block,
                                              num_warps=warps)
-        ctx.save_for_backward(x2, weight, rstd)
+        ctx.save_for_backward(xhat, weight, rstd)
+        ctx.x_dtype = x.dtype
         ctx.shape, ctx.block, ctx.warps = shape, block, warps
         return y.view(*shape[:-1], cols)
 
     @staticmethod
     def backward(ctx, dy):
-        x2, weight, rstd = ctx.saved_tensors
-        rows, cols = x2.shape
+        xhat, weight, rstd = ctx.saved_tensors
+        rows, cols = xhat.shape
         dy2 = dy.reshape(rows, cols).contiguous()
-        dx = torch.empty_like(x2)
+        dx = torch.empty((rows, cols), dtype=ctx.x_dtype, device=xhat.device)
         if rows:
-            soup_rmsnorm_bwd_kernel[(rows,)](dy2, x2, weight, rstd, dx, cols, BLOCK=ctx.block,
+            soup_rmsnorm_bwd_kernel[(rows,)](dy2, xhat, weight, rstd, dx, cols, BLOCK=ctx.block,
                                              num_warps=ctx.warps)
         return dx.view(ctx.shape), None, None, None
 

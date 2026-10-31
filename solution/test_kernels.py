@@ -125,3 +125,40 @@ def test_inplace_swiglu_matches_pytorch(dtype, shape):
     torch.testing.assert_close(out.float(), ref, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(gate.grad.float(), ref_dgate, rtol=3e-3, atol=3e-3)
     torch.testing.assert_close(up.grad.float(), ref_dup, rtol=3e-3, atol=3e-3)
+
+
+@pytest.mark.parametrize("heads", [12, 2])
+def test_rope_matches_pytorch(heads):
+    from transformers.models.qwen2.modeling_qwen2 import rotate_half
+
+    from solution.rope import rope_half
+
+    torch.manual_seed(0)
+    batch, seq, dim = 3, 50, 128
+    # q as Qwen2Attention builds it: a [B, T, H*D] projection viewed as [B, H, T, D]
+    q = torch.randn(batch, seq, heads * dim, device="cuda", dtype=torch.float16)
+    q = q.view(batch, seq, heads, dim).transpose(1, 2).detach().requires_grad_(True)
+    k = torch.randn(batch, heads, seq, dim, device="cuda", dtype=torch.float16, requires_grad=True)
+    freqs = torch.rand(1, seq, dim // 2, device="cuda") * 3
+    emb = torch.cat([freqs, freqs], -1)
+    cos, sin = emb.cos(), emb.sin()
+    gq = torch.randn(batch, heads, seq, dim, device="cuda", dtype=torch.float16)
+    gk = torch.randn_like(gq)
+
+    c, s = cos.unsqueeze(1), sin.unsqueeze(1)
+    ref_q = q.float() * c + rotate_half(q.float()) * s
+    ref_k = k.float() * c + rotate_half(k.float()) * s
+    (ref_q * gq.float()).sum().backward()
+    (ref_k * gk.float()).sum().backward()
+    ref_dq, ref_dk = q.grad.float(), k.grad.float()
+    q.grad = k.grad = None
+
+    with torch.autocast("cuda", dtype=torch.float16):
+        out_q, out_k = rope_half(q, k, cos, sin)
+    assert out_q.dtype == torch.float16
+    (out_q.float() * gq.float()).sum().backward()
+    (out_k.float() * gk.float()).sum().backward()
+    torch.testing.assert_close(out_q.float(), ref_q, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(out_k.float(), ref_k, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(q.grad.float(), ref_dq, rtol=2e-3, atol=4e-3)
+    torch.testing.assert_close(k.grad.float(), ref_dk, rtol=2e-3, atol=4e-3)
