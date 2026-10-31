@@ -70,7 +70,9 @@ def nf4_dequantize(packed, quant_state):
     out = torch.empty(tuple(quant_state.shape), dtype=torch.float16, device=packed.device)
     n_bytes = packed.numel()
     state2 = quant_state.state2
-    offset = quant_state.offset.reshape(1).to(torch.float32)
+    offset = quant_state.offset  # an fp32 scalar on the GPU: the kernel loads it by pointer
+    if offset.dtype != torch.float32:
+        offset = offset.float()
     soup_nf4_dequant_kernel[(triton.cdiv(n_bytes, BLOCK),)](
         packed, quant_state.absmax, state2.code, state2.absmax, offset, _lut(packed.device), out,
         n_bytes, BLOCK=BLOCK, BYTES_PER_SCALE=32, SCALES_PER_SCALE2=256, num_warps=WARPS)
