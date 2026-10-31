@@ -11,7 +11,7 @@ Soup Kernel Challenge, Decentrathon 6.0. Подробное описание р�
 - Репозиторий, финальный коммит: https://github.com/BAITC-Hacks/hack-1b4f2831-larpers/commit/28c95e3b0e3482f2388c70e9b32d3916ddb59b14
 - Публичный Kaggle-ноутбук, сохранённая версия (`COMMIT` в нём = sha выше; та же ссылка есть
   в README):
-  https://www.kaggle.com/code/heyyazamat/larpers-soup-kernel-submission
+  https://www.kaggle.com/code/heyyazamat/larpers-soup-kernel-combo
 - Демо-видео (до 3 минут): TODO
 - Презентация: https://github.com/BAITC-Hacks/hack-1b4f2831-larpers/blob/main/assets/LARPERS_presentation.pdf
 
@@ -59,13 +59,15 @@ https://arxiv.org/abs/1805.02867), тип данных NF4 (QLoRA, https://arxiv
 таблица значений из bitsandbytes). Полный список источников — в README.
 
 ## Результаты на Kaggle T4 (из `runs/result.json` и `runs/checks.json` ноутбука выше)
-Коммит `33b91be`, `harness/run_task.py`, база и решение в одной сессии:
+Коммит `28c95e3` (версия 1 ноутбука), `harness/run_task.py`, база и решение в одной сессии:
 
 | | Базовый Soup | Наше решение | Соотношение |
 |---|---|---|---|
 | Время `soup train`, с | 86,53 | 55,31 | speedup 1,56x |
 | Пик памяти GPU, MiB | 14 345 | 639 | base/ours 22,4x |
 | Eval loss (открытые строки) | 2,04965 | 2,04961 | −0,002 % к базе |
+
+Версия 2 того же ноутбука (тот же коммит, повторный запуск на другой машине Kaggle T4): база 93,27 с → 62,44 с, speedup 1,49x; пик 641 MiB (22,4x); eval −0,004 %; 10 из 10 проверок. База на той машине тоже медленнее: 93,27 с против 86,53 с.
 
 - [x] Все 10 проверок `harness/check_rules.py` пройдены
 - [x] README.md переписан под наше решение: что сделано, как запустить, результаты, ограничения
