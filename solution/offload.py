@@ -66,7 +66,7 @@ class Offloader:
         seen = {}  # the same tensor saved by two nodes is copied once
 
         def pack(t):
-            if (keep_all or not t.is_cuda or t.numel() * t.element_size() < MIN_BYTES
+            if (keep_all or not t.is_cuda or t.untyped_storage().nbytes() < MIN_BYTES
                     or t.untyped_storage().data_ptr() in ring):
                 return t
             key = (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
@@ -88,7 +88,7 @@ class Offloader:
         stream = torch.cuda.current_stream()
         self.d2h.wait_stream(stream)
         tensors = []
-        with torch.cuda.stream(self.d2h):
+        with torch.cuda.stream(self.d2h), torch.no_grad():
             for entry in saved:
                 gpu = entry.gpu
                 if _dense(gpu):
@@ -110,6 +110,12 @@ class Offloader:
             old_tensors, old_done = self.pending.pop(0)
             stream.wait_event(old_done)
             del old_tensors
+
+    def drain(self):
+        stream = torch.cuda.current_stream()
+        for tensors, done in self.pending:
+            stream.wait_event(done)
+        self.pending = []
 
     def prune(self):
         self.pending = [(tensors, done) for tensors, done in self.pending if not done.query()]
@@ -165,6 +171,7 @@ class Offloader:
     def backward_start(self, index):
         """Gradient of layer `index`'s output is ready: its backward is about to run."""
         manager = self.manager
+        self.prune()
         if index + 1 in self.held:  # layer index+1 has finished its backward
             self.held.discard(index + 1)
             manager.release(index + 1)
@@ -208,6 +215,8 @@ def offloaded_layer(manager, index, run, hidden):
         out = run(hidden)
     off.flush(index)
     last = index == off.last
+    if last:  # nothing more comes before the backward: let the copies finish, free their GPU memory
+        off.drain()
     manager.release(index, keep=last)
     if last:
         off.held.add(index)
