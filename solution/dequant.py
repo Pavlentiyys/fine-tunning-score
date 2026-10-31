@@ -17,6 +17,9 @@ any call that needs no gradient go to bitsandbytes untouched.
 import torch
 
 MIN_ROWS = 512  # bitsandbytes' own switch to dequantize + F.linear on this GPU
+# with streamed weights, weights up to this many elements (q/k/v/o of Qwen2.5-1.5B, not the MLP)
+# are kept dense from the recompute to the backward; 0 switches it off
+KEEP_DENSE_MAX = 1536 * 1536
 
 
 class _Linear4bitDequantOnce(torch.autograd.Function):
@@ -46,18 +49,26 @@ class _Linear4bitNF4(torch.autograd.Function):
 
         if bias is not None and bias.dtype != a.dtype:
             bias = bias.to(a.dtype)  # what bitsandbytes' Linear4bit / autocast do with an fp32 bias
-        out = torch.nn.functional.linear(a, nf4_dequantize(packed, quant_state), bias)
+        weight = nf4_dequantize(packed, quant_state)
+        out = torch.nn.functional.linear(a, weight, bias)
+        ctx.dense = False
         if ctx.needs_input_grad[0]:
-            ctx.save_for_backward(packed)
-            ctx.quant_state = quant_state
+            if weight.numel() <= KEEP_DENSE_MAX:
+                # recompute + backward of the same layer: keep the small attention weights dense
+                # instead of dequantizing them a second time (q/k/v/o: ~11 MB per layer)
+                ctx.save_for_backward(weight)
+                ctx.dense = True
+            else:
+                ctx.save_for_backward(packed)
+                ctx.quant_state = quant_state
         return out
 
     @staticmethod
     def backward(ctx, grad):
         from .nf4 import nf4_dequantize
 
-        (packed,) = ctx.saved_tensors
-        weight = nf4_dequantize(packed, ctx.quant_state)
+        (saved,) = ctx.saved_tensors
+        weight = saved if ctx.dense else nf4_dequantize(saved, ctx.quant_state)
         return grad.to(weight.dtype) @ weight, None, None, None
 
 

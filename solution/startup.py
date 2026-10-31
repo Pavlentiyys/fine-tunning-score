@@ -57,3 +57,40 @@ def patch_dataset_map_fingerprint():
 
     map._soup_fingerprint = True
     Dataset.map = map
+
+
+# GPU memory outside PyTorch's allocator (nvidia-smi counts it, torch does not):
+# - the CUDA driver reserves the per-thread stack for every resident GPU thread, 1 KiB each by
+#   default (~40 MiB on a T4); it grows the stack by itself for a kernel that needs more;
+# - every thread that calls cuBLAS gets its own workspace (~8 MiB each by default). `:16:8`
+#   (eight 16 KiB chunks) is one of the two sizes cuBLAS documents for reproducible results.
+CUDA_STACK_BYTES = 16
+CUBLAS_WORKSPACE = ":16:8"
+
+
+def shrink_cuda_reserves():
+    import os
+
+    if CUBLAS_WORKSPACE and "CUBLAS_WORKSPACE_CONFIG" not in os.environ:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = CUBLAS_WORKSPACE  # read at the first cuBLAS call
+    if not CUDA_STACK_BYTES:
+        return
+    try:
+        import ctypes
+
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        torch.cuda.init()  # the harness made the context current already; this is a no-op then
+        driver = ctypes.CDLL("libcuda.so.1")
+        before = ctypes.c_size_t(0)
+        driver.cuCtxGetLimit(ctypes.byref(before), 0)  # CU_LIMIT_STACK_SIZE
+        status = driver.cuCtxSetLimit(0, ctypes.c_size_t(CUDA_STACK_BYTES))
+        after = ctypes.c_size_t(0)
+        driver.cuCtxGetLimit(ctypes.byref(after), 0)
+        print(f"[load] CUDA stack per thread {before.value} -> {after.value} bytes "
+              f"(status {status}); cuBLAS workspace {os.environ.get('CUBLAS_WORKSPACE_CONFIG')}",
+              flush=True)
+    except Exception as exc:  # noqa: BLE001 - the defaults stay
+        print(f"[load] CUDA stack limit unchanged: {exc!r}", flush=True)
