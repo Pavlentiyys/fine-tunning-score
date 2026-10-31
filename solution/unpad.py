@@ -101,36 +101,33 @@ class _Rows:
 
 def _attention_rows(attn, normed, layout):
     """Qwen2Attention.forward without padding. Each row's real tokens are contiguous in the
-    unpadded stream, so a row is a slice: q/k/v are projected for the real tokens only, rotated at
-    their positions, and attend causally within their row, which is exactly what the causal +
-    padding mask allowed for every real token. The attention work is sum(L_row^2) instead of
-    batch * L_max^2, and no padded tensor is built. K/V heads are repeated as transformers'
-    `repeat_kv` does and SDPA is called without a mask and without `enable_gqa` (on a T4 that would
-    fall back to the math kernel), so it runs the memory-efficient causal kernel."""
+    unpadded stream: q/k/v are projected for the real tokens only and rotated at their own
+    positions (one RoPE launch for all rows), then each row attends causally within itself, which
+    is exactly what the causal + padding mask allowed for every real token. The attention work is
+    sum(L_row^2) instead of batch * L_max^2, and no padded tensor is built. K/V heads are repeated
+    once for all tokens as transformers' `repeat_kv` does; SDPA runs per row without a mask and
+    without `enable_gqa` (on a T4 that would fall back to the math kernel), i.e. the memory-
+    efficient causal kernel. Rows are cut with `split` and joined with `cat`, whose backwards are
+    one concatenation / views (slicing would give every row's gradient a full-size zero tensor)."""
     from transformers.models.qwen2 import modeling_qwen2
 
     heads = attn.config.num_attention_heads
     kv_heads = attn.config.num_key_value_heads
     dim, groups = attn.head_dim, heads // kv_heads
-    query, key, value = attn.q_proj(normed), attn.k_proj(normed), attn.v_proj(normed)
-    outs, start = [], 0
-    for length in layout.lens:
-        if length == 0:
-            continue
-        stop = start + length
-        q = query[start:stop].view(1, length, heads, dim).transpose(1, 2)
-        k = key[start:stop].view(1, length, kv_heads, dim).transpose(1, 2)
-        v = value[start:stop].view(1, length, kv_heads, dim).transpose(1, 2)
-        q, k = modeling_qwen2.apply_rotary_pos_emb(q, k, layout.cos[start:stop].unsqueeze(0),
-                                                   layout.sin[start:stop].unsqueeze(0))
-        if groups > 1:
-            k = k[:, :, None].expand(1, kv_heads, groups, length, dim).reshape(1, heads, length, dim)
-            v = v[:, :, None].expand(1, kv_heads, groups, length, dim).reshape(1, heads, length, dim)
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=length > 1,
-                                                               scale=attn.scaling)
-        outs.append(out.transpose(1, 2).reshape(length, heads * dim))
-        start = stop
-    return attn.o_proj(torch.cat(outs) if len(outs) > 1 else outs[0])
+    tokens = normed.shape[0]
+    q = attn.q_proj(normed).view(1, tokens, heads, dim).transpose(1, 2)
+    k = attn.k_proj(normed).view(1, tokens, kv_heads, dim).transpose(1, 2)
+    v = attn.v_proj(normed).view(1, tokens, kv_heads, dim).transpose(1, 2)
+    q, k = modeling_qwen2.apply_rotary_pos_emb(q, k, layout.cos, layout.sin)
+    if groups > 1:
+        k = k[:, :, None].expand(1, kv_heads, groups, tokens, dim).reshape(1, heads, tokens, dim)
+        v = v[:, :, None].expand(1, kv_heads, groups, tokens, dim).reshape(1, heads, tokens, dim)
+    outs = [torch.nn.functional.scaled_dot_product_attention(
+                q_row, k_row, v_row, is_causal=q_row.shape[2] > 1, scale=attn.scaling)
+            for q_row, k_row, v_row in zip(q.split(layout.lens, dim=2), k.split(layout.lens, dim=2),
+                                           v.split(layout.lens, dim=2))]
+    out = torch.cat(outs, dim=2) if len(outs) > 1 else outs[0]
+    return attn.o_proj(out.transpose(1, 2).reshape(tokens, heads * dim))
 
 
 def _attention(attn, normed, rows, flat_len, shape, mask, position_embeddings, kwargs):
@@ -232,8 +229,9 @@ def patch_qwen2_model():
             cos, sin = position_embeddings
             batch_of = rows // seq if cos.shape[0] > 1 else torch.zeros_like(rows)
             col_of = rows % seq
-            layout = _Rows(attention_mask.sum(dim=1).tolist(), cos[batch_of, col_of].contiguous(),
-                           sin[batch_of, col_of].contiguous())
+            lens = [length for length in attention_mask.sum(dim=1).tolist() if length]
+            layout = _Rows(lens, cos[batch_of, col_of].unsqueeze(0).contiguous(),
+                           sin[batch_of, col_of].unsqueeze(0).contiguous())
             masks = {"full_attention": layout}
         else:
             mask_kwargs = {"config": self.config, "inputs_embeds": embeds,
