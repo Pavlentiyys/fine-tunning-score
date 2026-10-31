@@ -28,7 +28,7 @@
 | Репозиторий команды, финальный коммит | https://github.com/BAITC-Hacks/hack-1b4f2831-larpers/commit/28c95e3b0e3482f2388c70e9b32d3916ddb59b14 |
 | Публичный Kaggle-ноутбук (сохранённая версия, `COMMIT` в нём = коммит выше) | https://www.kaggle.com/code/heyyazamat/larpers-soup-kernel-combo |
 | Демо-видео (до 3 минут) | **TODO** |
-| Презентация | https://github.com/BAITC-Hacks/hack-1b4f2831-larpers/blob/main/assets/LARPERS_presentation.pdf (`assets/LARPERS_presentation.pdf`) |
+| Презентация (PDF) | https://drive.google.com/drive/folders/1XKP456izSagmXDQB-UmTQA8-u5DS5u-u?usp=sharing (копия в репозитории: `assets/LARPERS_presentation.pdf`) |
 | Задание и исходный стартовый набор | https://github.com/MakazhanAlpamys/soup-kernel-challenge |
 
 Заполненная форма сдачи лежит в [`SUBMISSION.md`](SUBMISSION.md).
