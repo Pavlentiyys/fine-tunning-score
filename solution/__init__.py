@@ -13,6 +13,7 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+from .dequant import patch_bnb_matmul_4bit
 from .stream import patch_bnb_offload
 from .prepare import patch_kbit_preparation
 from .lora import patch_peft_lora_4bit
@@ -24,6 +25,7 @@ from .unpad import patch_qwen2_model
 
 
 def apply():
+    patch_bnb_matmul_4bit()  # NF4 weight dequantized once for recompute + backward
     patch_bnb_offload()  # 4-bit weights go to pinned CPU memory as they are quantized
     patch_kbit_preparation()  # the tied embedding stays fp16: no fp32 copy, no allocator spike
     patch_qwen2_mlp_own()  # our SwiGLU, backward in place over the saved gate/up

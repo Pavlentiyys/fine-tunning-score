@@ -191,3 +191,34 @@ def test_lora_add_matches_pytorch():
         # fp16 matmuls summing over hundreds of tokens: compare against the tensor's own scale
         scale = want.abs().max().item()
         torch.testing.assert_close(got.float(), want, rtol=1e-2, atol=2e-3 * scale)
+
+
+@pytest.mark.parametrize("rows", [700, 64])
+def test_dequant_once_matches_bitsandbytes(rows):
+    import bitsandbytes as bnb
+
+    import solution.dequant as dequant
+
+    torch.manual_seed(0)
+    n_out, k_in = 512, 256
+    weight = torch.randn(n_out, k_in, device="cuda", dtype=torch.float16)
+    packed, state = bnb.functional.quantize_4bit(weight, blocksize=64, compress_statistics=True,
+                                                 quant_type="nf4")
+    bias = torch.randn(n_out, device="cuda", dtype=torch.float16)
+    x = torch.randn(rows, k_in, device="cuda", dtype=torch.float16, requires_grad=True)
+    grad = torch.randn(rows, n_out, device="cuda", dtype=torch.float16)
+
+    ref = bnb.matmul_4bit(x, packed.t(), quant_state=state, bias=bias)
+    ref.backward(grad)
+    ref_dx = x.grad.clone()
+    x.grad = None
+
+    original = bnb.matmul_4bit
+    dequant.patch_bnb_matmul_4bit()
+    try:
+        out = bnb.matmul_4bit(x, packed.t(), quant_state=state, bias=bias)
+        out.backward(grad)
+    finally:
+        bnb.matmul_4bit = original
+    torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(x.grad, ref_dx, rtol=2e-3, atol=2e-3)
