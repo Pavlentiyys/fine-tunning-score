@@ -19,7 +19,7 @@ Soup Kernel Challenge, Decentrathon 6.0. Подробное описание р�
 | Имя | Роль | GitHub | Kaggle | Контакт (капитан) |
 |---|---|---|---|---|
 | Серік Азамат | разработчик | [heyyAzamat](https://github.com/heyyAzamat) | [heyyazamat](https://www.kaggle.com/heyyazamat) | |
-| Пичугин Павел | разработчик | [Pavlentiyys](https://github.com/Pavlentiyys) | [mirceya](https://www.kaggle.com/mirceya) | |
+| Пичугин Павел | разработчик | [Pavlentiyys](https://github.com/Pavlentiyys) | [mirceya](https://www.kaggle.com/mirceya) | Telegram `@Mirceya`, paulentiyss@gmail.com |
 
 ## Что сделано (коротко)
 Фиксированный запуск `soup train` (Qwen2.5-1.5B-Instruct, NF4, LoRA r=16 на q/v, 64 шага, Kaggle T4)
